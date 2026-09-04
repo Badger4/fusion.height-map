@@ -29,6 +29,7 @@ import json
 import struct
 import tempfile
 import subprocess
+import time
 from collections import deque
 
 try:
@@ -86,7 +87,7 @@ def ensure_pillow(ui):
     except ImportError:
         res = ui.messageBox(
             "Модуль Pillow (PIL) не знайдено у вбудованому Python-середовищі Fusion 360.\n\n"
-            "Бажаєте встановити його автоматично прямо зараз в один клік?",
+            "Бажаєте встановити його автоматично прямо зараз?",
             "Авто-встановлення Pillow",
             adsk.core.MessageBoxButtonTypes.YesNoButtonType,
             adsk.core.MessageBoxIconTypes.QuestionIconType
@@ -94,16 +95,44 @@ def ensure_pillow(ui):
         if res == adsk.core.DialogResults.DialogYes:
             progress = ui.createProgressDialog()
             progress.isCancelButtonShown = False
-            progress.show("Встановлення Pillow", "Завантаження та встановлення через pip...", 0, 100, 1)
+            progress.show("Встановлення Pillow", "Перевірка pip...", 0, 100, 1)
             try:
-                cmd = [sys.executable, "-m", "pip", "install", "Pillow"]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                # 1. Ініціалізація ensurepip (якщо pip відсутній)
+                progress.progressValue = 20
+                progress.message = "Ініціалізація пакета pip..."
+                proc_pip = subprocess.Popen(
+                    [sys.executable, "-m", "ensurepip", "--default-pip"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                while proc_pip.poll() is None:
+                    adsk.doEvents()
+                    time.sleep(0.05)
+
+                # 2. Встановлення Pillow
+                progress.progressValue = 50
+                progress.message = "Завантаження та встановлення Pillow..."
+                proc_inst = subprocess.Popen(
+                    [sys.executable, "-m", "pip", "install", "Pillow", "--disable-pip-version-check"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                while proc_inst.poll() is None:
+                    adsk.doEvents()
+                    time.sleep(0.05)
+
+                out, err = proc_inst.communicate()
                 progress.hide()
-                if proc.returncode == 0:
+
+                if proc_inst.returncode == 0:
                     ui.messageBox("Pillow успішно встановлено!")
                     return True
                 else:
-                    ui.messageBox(f"Помилка встановлення Pillow:\n{proc.stderr}\n{proc.stdout}")
+                    err_text = err.decode('utf-8', errors='ignore') if err else 'Невідома помилка'
+                    ui.messageBox(
+                        f"Не вдалося встановити Pillow автоматично.\n\n"
+                        f"Помилка: {err_text}\n\n"
+                        f"Виконайте в PowerShell:\n"
+                        f'& "{sys.executable}" -m pip install Pillow'
+                    )
                     return False
             except Exception:
                 progress.hide()
