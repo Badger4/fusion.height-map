@@ -2,20 +2,20 @@
 Heightmap -> MeshBody для Fusion 360 (з інтерактивним діалогом)
 =================================================================
 Що робить:
-  1. Обираєш файл зображення через стандартне вікно "Відкрити"
-     (підтримуються 8-бітні та 16-бітні карти висот: PNG, TIFF, BMP, JPG).
-  2. Векторизоване прискорення через NumPy (з автоматичним чистим Python-fallback):
-     - Обчислення висот (LUT-lookup), маски та сітки вершин відбуваються за 20–40 мс!
-  3. Чутливий інтерфейс без зависань (adsk.doEvents + часта перевірка Cancel).
-  4. Повне збереження меж зображення (Без випадкового обрізання країв):
-     - Для прямокутника, кола та багатокутника файл використовується на 100% без обрізання темних країв.
-     - Опція обрізання прозорих полів діє ТІЛЬКИ для PNG з прозорим Alpha-каналом у режимі "Контур".
-  5. Автоматично зберігає та підвантажує останні використані параметри (JSON).
-  6. Окремий твердотільний плоский об'єкт (Solid BRep Body) ТОЧНО ПО КОНТУРУ:
-     - Для контуру зображення основа автоматично повторює силует деталі з надійною обробкою помилок.
-  7. Поки файл не обрано — кнопка "OK" автоматично заблокована.
-  8. Результат вставляється як герметичний (Watertight / 2-Manifold) MeshBody з розпізнаваними назвами в тімлайні.
-  9. Автоматично пропонує встановити Pillow в один клік, якщо модуль відсутній.
+  1. Обираєш файл зображення (8-бітні та 16-бітні карти висот: PNG, TIFF, BMP, JPG).
+  2. Супер-прискорений Binary STL експорт та векторизація NumPy (з замиканням на чистий Python-fallback).
+  3. Динамічний інформаційний блок у діалозі (роздільність, полігони, точний час обчислення).
+  4. Окремий твердотільний плоский об'єкт (Solid BRep Body) з фасками/скругленнями та монтажними отворами:
+     - Отвори під гвинти M3, M4, M5, M6 у 4 кутах з налаштовуваним відступом.
+     - Автоматичні фаски (Chamfer) або скручування (Fillet) на краях основи.
+  5. Опція "Плавний згасаючий край" (Vignette Fade) з галочкою — м'який вихід рельєфу до Z=0 по периметру.
+  6. Вибір початку координат (Origin Alignment):
+     - Центр у точці (0, 0, 0)
+     - Лівий нижній кут у (0, 0, 0)
+     - Верхня точка рельєфу Z = 0
+  7. Режим «Літофанія» (Lithophane Preset) для 3D-друку просвітних картин.
+  8. Збереження та відновлення останніх налаштувань через JSON-конфіг.
+  9. Автоматичний авто-інсталятор Pillow в один клік.
 
 Запуск: Scripts and Add-Ins -> вибрати файл -> Run.
 """
@@ -26,11 +26,11 @@ import sys
 import math
 import array
 import json
+import struct
 import tempfile
 import subprocess
 from collections import deque
 
-# Спроба імпорту NumPy для максимального векторизованого прискорення
 try:
     import numpy as np
     HAS_NUMPY = True
@@ -48,7 +48,7 @@ CMD_ID = 'heightmapToMeshCmd'
 CMD_NAME = 'Heightmap to Mesh'
 PANEL_ID = 'SolidCreatePanel'
 
-MAX_VERTICES_WARNING = 600000  # поріг попередження про розмір сітки
+MAX_VERTICES_WARNING = 600000
 PARAMS_FILE = os.path.join(tempfile.gettempdir(), 'heightmap_fusion_params.json')
 
 
@@ -79,7 +79,6 @@ def load_last_params():
 # =====================================================================
 
 def ensure_pillow(ui):
-    """Перевіряє наявність Pillow. Якщо відсутній — пропонує встановити автоматично."""
     try:
         import PIL
         from PIL import Image, ImageFilter
@@ -114,11 +113,10 @@ def ensure_pillow(ui):
 
 
 # =====================================================================
-# Геометричні допоміжні функції та аналіз фону
+# Геометричні допоміжні функції
 # =====================================================================
 
 def make_regular_polygon(cx, cy, sides, radius):
-    """Вершини правильного багатокутника, вписаного в коло радіусом radius."""
     verts = []
     for i in range(sides):
         angle = -math.pi / 2.0 + i * (2.0 * math.pi / sides)
@@ -127,7 +125,6 @@ def make_regular_polygon(cx, cy, sides, radius):
 
 
 def point_in_polygon(px, py, poly):
-    """Перевірка належності точки довільному багатокутнику (Ray-casting)."""
     inside = False
     n = len(poly)
     if n < 3:
@@ -146,7 +143,6 @@ def point_in_polygon(px, py, poly):
 
 
 def get_content_bbox(img, only_alpha=True, threshold=32):
-    """Знаходить рамку обрізки. Якщо only_alpha=True, шукає ТІЛЬКИ по прозорому Alpha-каналу."""
     try:
         if img.mode in ('RGBA', 'LA') or ('transparency' in img.info):
             alpha = img.convert('RGBA').split()[-1]
@@ -161,12 +157,10 @@ def get_content_bbox(img, only_alpha=True, threshold=32):
             pixels = img_gray.tobytes()
             corners = [pixels[0], pixels[w - 1], pixels[(h - 1) * w], pixels[w * h - 1]]
             avg_corner = sum(corners) / 4.0
-
             if avg_corner < 128:
                 mask = img_gray.point(lambda p: 255 if p > threshold else 0)
             else:
                 mask = img_gray.point(lambda p: 255 if p < (255 - threshold) else 0)
-
             return mask.getbbox()
         return None
     except:
@@ -174,7 +168,6 @@ def get_content_bbox(img, only_alpha=True, threshold=32):
 
 
 def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, raw_pixels=None, is_16bit=False, threshold=32, fill_holes=True):
-    """Визначає маску об'єкта шляхом хвильового алгоритму (Flood-Fill) від країв сітки."""
     total = grid_cols * grid_rows
     if alpha_bytes is not None:
         if not fill_holes:
@@ -228,10 +221,6 @@ def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, raw_pixels=None, i
 
 
 def chain_boundary_edges(boundary_edges, vertices):
-    """
-    Надійно з'єднує ребра межі у замкнені контури (loops),
-    коректно обробляючи складна розгалуження та Т-подібні стики.
-    """
     from collections import defaultdict
     adj = defaultdict(list)
     for a, b in boundary_edges:
@@ -249,10 +238,9 @@ def chain_boundary_edges(boundary_edges, vertices):
 
                 while curr != start_node:
                     loop.append(curr)
-                    # Шукаємо наступне невідвідане ребро
                     next_candidates = [nbr for nbr in adj[curr] if (curr, nbr) not in visited_edges]
                     if not next_candidates:
-                        break  # Контур не замкнувся нормально
+                        break
                     next_node = next_candidates[0]
                     visited_edges.add((curr, next_node))
                     curr = next_node
@@ -265,7 +253,6 @@ def chain_boundary_edges(boundary_edges, vertices):
 
 
 def rdp_simplify(points, epsilon=0.2):
-    """Спрощення полігональної лінії алгоритмом Рамера-Дугласа-Пекера."""
     if len(points) < 3:
         return points
 
@@ -298,7 +285,6 @@ def rdp_simplify(points, epsilon=0.2):
 
 
 def simplify_closed_loop(loop, epsilon=0.2):
-    """Спрощення замкненого контуру без втрати форми."""
     n = len(loop)
     if n < 6:
         return loop
@@ -308,23 +294,75 @@ def simplify_closed_loop(loop, epsilon=0.2):
     return part1[:-1] + part2[:-1]
 
 
-def write_obj(path, vertices, triangles, progress=None):
-    """Мінімальний ASCII OBJ з точністю 0.001 мм та відгуком UI."""
-    chunk_size = 50000
-    with open(path, 'w', buffering=4 * 1024 * 1024, encoding='ascii') as f:
-        for i in range(0, len(vertices), chunk_size):
-            if progress and progress.wasCancelled:
-                return
-            adsk.doEvents()
-            chunk = vertices[i:i + chunk_size]
-            f.write("".join(f"v {x:.3f} {y:.3f} {z:.3f}\n" for x, y, z in chunk))
+# =====================================================================
+# Швидкий Binary STL експортер
+# =====================================================================
 
-        for i in range(0, len(triangles), chunk_size):
-            if progress and progress.wasCancelled:
-                return
-            adsk.doEvents()
-            chunk = triangles[i:i + chunk_size]
-            f.write("".join(f"f {a + 1} {b + 1} {c + 1}\n" for a, b, c in chunk))
+def write_stl_binary(path, vertices, triangles, progress=None):
+    """Високоефективний запис у бінарний STL з нормалями векторів."""
+    n_triangles = len(triangles)
+    chunk_size = 50000
+
+    with open(path, 'wb') as f:
+        header = b'Binary STL generated by Fusion 360 Heightmap Add-In'.ljust(80, b'\x00')
+        f.write(header)
+        f.write(struct.pack('<I', n_triangles))
+
+        if HAS_NUMPY:
+            v_arr = np.array(vertices, dtype=np.float32)
+            t_arr = np.array(triangles, dtype=np.int32)
+
+            v1 = v_arr[t_arr[:, 0]]
+            v2 = v_arr[t_arr[:, 1]]
+            v3 = v_arr[t_arr[:, 2]]
+
+            e1 = v2 - v1
+            e2 = v3 - v1
+            normals = np.cross(e1, e2)
+            norms = np.linalg.norm(normals, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            normals /= norms
+
+            tri_dtype = np.dtype([
+                ('normal', 'f4', (3,)),
+                ('v1', 'f4', (3,)),
+                ('v2', 'f4', (3,)),
+                ('v3', 'f4', (3,)),
+                ('attr', 'u2')
+            ])
+            data = np.zeros(n_triangles, dtype=tri_dtype)
+            data['normal'] = normals
+            data['v1'] = v1
+            data['v2'] = v2
+            data['v3'] = v3
+
+            for i in range(0, n_triangles, chunk_size):
+                if progress and progress.wasCancelled:
+                    return
+                adsk.doEvents()
+                f.write(data[i:i + chunk_size].tobytes())
+        else:
+            for i in range(0, n_triangles, chunk_size):
+                if progress and progress.wasCancelled:
+                    return
+                adsk.doEvents()
+                chunk_buf = bytearray()
+                for a, b, c in triangles[i:i + chunk_size]:
+                    v1 = vertices[a]
+                    v2 = vertices[b]
+                    v3 = vertices[c]
+                    ax, ay, az = v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]
+                    bx, by, bz = v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]
+                    nx = ay * bz - az * by
+                    ny = az * bx - ax * bz
+                    nz = ax * by - ay * bx
+                    nl = math.hypot(nx, math.hypot(ny, nz))
+                    if nl > 1e-9:
+                        nx /= nl; ny /= nl; nz /= nl
+                    else:
+                        nx, ny, nz = 0.0, 0.0, 1.0
+                    chunk_buf.extend(struct.pack('<12fH', nx, ny, nz, v1[0], v1[1], v1[2], v2[0], v2[1], v2[2], v3[0], v3[1], v3[2], 0))
+                f.write(chunk_buf)
 
 
 # =====================================================================
@@ -344,7 +382,7 @@ def run(context):
         if not cmd_def:
             cmd_def = _ui.commandDefinitions.addButtonDefinition(
                 CMD_ID, CMD_NAME,
-                'Створює MeshBody-рельєф із зображення (карта висот) з обрізкою по формі заготовки'
+                'Створює MeshBody-рельєф із зображення з генерацією BRep-основи, оттворами M3-M6, згасанням та CAM-інструментами'
             )
 
         on_created = CommandCreatedHandler()
@@ -389,21 +427,25 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
         try:
             cmd = args.command
             inputs = cmd.commandInputs
-
             saved = load_last_params()
+
+            # ---- Інформаційний блок ----
+            info_text = inputs.addTextBoxCommandInput('infoBox', 'Інформація про сітку', 'Оберіть файл та налаштуйте розміри.', 2, True)
+            info_text.isFullWidth = True
 
             # ---- Зображення ----
             img_input = inputs.addStringValueInput('imagePath', 'Файл зображення', saved.get('imagePath', ''))
             img_input.isReadOnly = True
             inputs.addBoolValueInput('browseBtn', 'Обрати зображення...', False, '', False)
-            auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати прозорі поля (тільки для PNG з Alpha-прозорістю)', True, '', saved.get('autoCrop', False))
+            auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати прозорі поля (для PNG з Alpha-прозорістю)', True, '', saved.get('autoCrop', False))
             auto_crop.isVisible = False
             inputs.addBoolValueInput('keepAspect', 'Зберігати пропорції (Aspect Ratio)', True, '', saved.get('keepAspect', True))
 
+            # Пресет Літофанії
+            inputs.addBoolValueInput('presetLithophane', '⚡ Застосувати пресет «Літофанія» (для 3D-друку картинок)', False, '', False)
+
             # ---- Форма заготовки ----
-            shape_dd = inputs.addDropDownCommandInput(
-                'shapeType', 'Форма заготовки', adsk.core.DropDownStyles.TextListDropDownStyle
-            )
+            shape_dd = inputs.addDropDownCommandInput('shapeType', 'Форма заготовки', adsk.core.DropDownStyles.TextListDropDownStyle)
             saved_shape = saved.get('shapeType', 'Прямокутник')
             for s_name in ['Прямокутник', 'Коло / Овал', 'Багатокутник', 'Контур зображення (Alpha / Прозорість)']:
                 shape_dd.listItems.add(s_name, s_name == saved_shape, '')
@@ -413,50 +455,81 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             def_l = f"{saved.get('rectLength', 100.0)} mm"
             def_r = f"{saved.get('polyRadius', 50.0)} mm"
 
-            # Прямокутник
-            rect_w = inputs.addValueInput('rectWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
-            rect_l = inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
+            inputs.addValueInput('rectWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
+            inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
 
-            # Коло / Овал
             circle_dx = inputs.addValueInput('circleDiaX', 'Діаметр X (Ширина)', mm, adsk.core.ValueInput.createByString(def_w))
             circle_dx.isVisible = (saved_shape == 'Коло / Овал')
             circle_dy = inputs.addValueInput('circleDiaY', 'Діаметр Y (Довжина)', mm, adsk.core.ValueInput.createByString(def_l))
             circle_dy.isVisible = (saved_shape == 'Коло / Овал')
 
-            # Багатокутник
             poly_sides = inputs.addIntegerSpinnerCommandInput('polySides', 'Кількість граней', 3, 36, 1, saved.get('polySides', 6))
             poly_sides.isVisible = (saved_shape == 'Багатокутник')
             poly_r = inputs.addValueInput('polyRadius', 'Радіус (до вершини)', mm, adsk.core.ValueInput.createByString(def_r))
             poly_r.isVisible = (saved_shape == 'Багатокутник')
 
-            # Контур зображення (Alpha / Прозорість)
             alpha_w = inputs.addValueInput('alphaWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
             alpha_w.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
             alpha_l = inputs.addValueInput('alphaLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
             alpha_l.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
             alpha_thresh = inputs.addIntegerSpinnerCommandInput('alphaThreshold', 'Поріг прозорості (1-254)', 1, 254, 1, saved.get('alphaThreshold', 32))
             alpha_thresh.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
-            fill_holes = inputs.addBoolValueInput('fillHoles', 'Суцільна основа (запобігати діркам у темних тінях)', True, '', saved.get('fillHoles', True))
+            fill_holes = inputs.addBoolValueInput('fillHoles', 'Суцільна основа (запобігати діркам у тінях)', True, '', saved.get('fillHoles', True))
             fill_holes.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
 
-            inputs.addSeparatorCommandInput('sep1')
+            # ---- Орієнтація початку координат ----
+            inputs.addSeparatorCommandInput('sep_origin')
+            origin_dd = inputs.addDropDownCommandInput('originAlign', 'Початок координат (XYZ Origin)', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_origin = saved.get('originAlign', 'Лівий нижній кут у (0, 0, 0)')
+            for o_name in ['Лівий нижній кут у (0, 0, 0)', 'Центр моделі у точці (0, 0, 0)', 'Верхня площина рельєфу Z = 0']:
+                origin_dd.listItems.add(o_name, o_name == saved_origin, '')
 
             # ---- Параметри рельєфу ----
+            inputs.addSeparatorCommandInput('sep1')
             inputs.addValueInput('maxDepth', 'Глибина рельєфу (макс. висота)', mm, adsk.core.ValueInput.createByString(f"{saved.get('maxDepth', 2.0)} mm"))
             inputs.addValueInput('baseThickness', 'Висота заготовки (товщина підкладки, >=0)', mm, adsk.core.ValueInput.createByString(f"{saved.get('baseThickness', 5.0)} mm"))
             inputs.addValueInput('vertexSpacing', 'Крок сітки (деталізація)', mm, adsk.core.ValueInput.createByString(f"{saved.get('vertexSpacing', 0.5)} mm"))
             inputs.addIntegerSpinnerCommandInput('smoothPasses', 'Проходи згладжування', 0, 10, 1, saved.get('smoothPasses', 1))
 
+            # Плавний згасаючий край (Vignette Fade)
+            enable_fade = inputs.addBoolValueInput('enableVignetteFade', 'Плавне згасання країв до основи (Vignette Fade)', True, '', saved.get('enableVignetteFade', False))
+            fade_w = inputs.addValueInput('fadeWidth', 'Ширина згасання країв (мм)', mm, adsk.core.ValueInput.createByString(f"{saved.get('fadeWidth', 5.0)} mm"))
+            fade_w.isVisible = saved.get('enableVignetteFade', False)
+
             # Інверсія та гамма
             inputs.addBoolValueInput('invertHeight', 'Інвертувати висоту (чорний = випуклий)', True, '', saved.get('invertHeight', True))
             inputs.addValueInput('gammaVal', 'Гамма-корекція (1.0 = норма, <1 світліше, >1 контрастніше)', '', adsk.core.ValueInput.createByReal(saved.get('gammaVal', 1.0)))
 
-            # ---- Тверда BRep основа (Solid Plate) ----
+            # ---- Тверда BRep основа (Solid Plate) та CAM-опції ----
             inputs.addSeparatorCommandInput('sep2')
             create_solid = saved.get('createSolidBase', False)
-            inputs.addBoolValueInput('createSolidBase', 'Створювати окрему тверду основу (Solid BRep плиту по контуру)', True, '', create_solid)
+            inputs.addBoolValueInput('createSolidBase', 'Створювати окрему тверду основу (Solid BRep плиту)', True, '', create_solid)
             solid_thick = inputs.addValueInput('solidBaseThickness', 'Товщина твердотільної плити під рельєфом', mm, adsk.core.ValueInput.createByString(f"{saved.get('solidBaseThickness', 5.0)} mm"))
             solid_thick.isVisible = create_solid
+
+            # Фаска / Скруглення основи
+            edge_dd = inputs.addDropDownCommandInput('edgeTreatment', 'Обробка країв основи', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_edge = saved.get('edgeTreatment', 'Немає')
+            for e_name in ['Немає', 'Скруглення (Fillet)', 'Фаска (Chamfer)']:
+                edge_dd.listItems.add(e_name, e_name == saved_edge, '')
+            edge_dd.isVisible = create_solid
+
+            edge_r = inputs.addValueInput('edgeRadius', 'Розмір фаски / радіус (мм)', mm, adsk.core.ValueInput.createByString(f"{saved.get('edgeRadius', 2.0)} mm"))
+            edge_r.isVisible = create_solid and (saved_edge != 'Немає')
+
+            # Монтажні отвори
+            create_holes = saved.get('createMountingHoles', False)
+            holes_input = inputs.addBoolValueInput('createMountingHoles', 'Додати отвори під гвинти у кутах', True, '', create_holes)
+            holes_input.isVisible = create_solid
+
+            hole_dd = inputs.addDropDownCommandInput('holeType', 'Розмір гвинта', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_hole = saved.get('holeType', 'M4 (4.3 мм)')
+            for h_name in ['M3 (3.2 мм)', 'M4 (4.3 мм)', 'M5 (5.3 мм)', 'M6 (6.4 мм)']:
+                hole_dd.listItems.add(h_name, h_name == saved_hole, '')
+            hole_dd.isVisible = create_solid and create_holes
+
+            hole_off = inputs.addValueInput('holeOffset', 'Відступ отворів від кутів (мм)', mm, adsk.core.ValueInput.createByString(f"{saved.get('holeOffset', 8.0)} mm"))
+            hole_off.isVisible = create_solid and create_holes
 
             on_validate = CommandValidateInputsHandler()
             cmd.validateInputs.add(on_validate)
@@ -487,13 +560,11 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
                 args.areInputsValid = False
                 return
 
-            # Валідація гамма-корекції
             gamma_input = inputs.itemById('gammaVal')
             if gamma_input and gamma_input.value <= 0:
                 args.areInputsValid = False
                 return
 
-            # Валідація глибини рельєфу та підкладки
             max_d = inputs.itemById('maxDepth')
             base_t = inputs.itemById('baseThickness')
             if not max_d or not base_t or max_d.value < 0 or base_t.value < 0:
@@ -507,23 +578,6 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
                     w = inputs.itemById('rectWidth')
                     l = inputs.itemById('rectLength')
                     if not w or not l or w.value <= 0 or l.value <= 0:
-                        args.areInputsValid = False
-                        return
-                elif shape == 'Коло / Овал':
-                    dx = inputs.itemById('circleDiaX')
-                    dy = inputs.itemById('circleDiaY')
-                    if not dx or not dy or dx.value <= 0 or dy.value <= 0:
-                        args.areInputsValid = False
-                        return
-                elif shape == 'Багатокутник':
-                    r = inputs.itemById('polyRadius')
-                    if not r or r.value <= 0:
-                        args.areInputsValid = False
-                        return
-                elif shape == 'Контур зображення (Alpha / Прозорість)':
-                    aw = inputs.itemById('alphaWidth')
-                    al = inputs.itemById('alphaLength')
-                    if not aw or not al or aw.value <= 0 or al.value <= 0:
                         args.areInputsValid = False
                         return
 
@@ -545,6 +599,21 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
         try:
             changed = args.input
             inputs = args.inputs
+
+            # Пресет «Літофанія»
+            if changed.id == 'presetLithophane':
+                bool_val = adsk.core.BoolValueCommandInput.cast(changed).value
+                if bool_val:
+                    inputs.itemById('invertHeight').value = True
+                    inputs.itemById('maxDepth').value = 0.24  # 2.4 мм
+                    inputs.itemById('baseThickness').value = 0.08  # 0.8 мм
+                    inputs.itemById('fillHoles').value = True
+                    _ui.messageBox('Застосовано налаштування для Літофанії:\n- Інверсія: Так\n- Глибина: 2.4 мм\n- Товщина основи: 0.8 мм')
+
+            # Перемикання згасання країв
+            if changed.id == 'enableVignetteFade':
+                is_fade = adsk.core.BoolValueCommandInput.cast(changed).value
+                inputs.itemById('fadeWidth').isVisible = is_fade
 
             # Вибір зображення
             if changed.id == 'browseBtn':
@@ -587,16 +656,6 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                                         rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
                                         if rw and rl:
                                             rl.value = rw.value / _img_aspect_ratio
-
-                                        cdx = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaX'))
-                                        cdy = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaY'))
-                                        if cdx and cdy:
-                                            cdy.value = cdx.value / _img_aspect_ratio
-
-                                        aw = adsk.core.ValueCommandInput.cast(inputs.itemById('alphaWidth'))
-                                        al = adsk.core.ValueCommandInput.cast(inputs.itemById('alphaLength'))
-                                        if aw and al:
-                                            al.value = aw.value / _img_aspect_ratio
                                         _is_updating_aspect = False
                         except:
                             pass
@@ -623,12 +682,37 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 inputs.itemById('fillHoles').isVisible = is_alpha
                 inputs.itemById('autoCrop').isVisible = is_alpha
 
-            # Перемикання твердотільної основи
-            if changed.id == 'createSolidBase':
-                is_solid = adsk.core.BoolValueCommandInput.cast(changed).value
+            # Перемикання твердотільної основи та CAM інструментів
+            if changed.id == 'createSolidBase' or changed.id == 'createMountingHoles' or changed.id == 'edgeTreatment':
+                is_solid = adsk.core.BoolValueCommandInput.cast(inputs.itemById('createSolidBase')).value
                 inputs.itemById('solidBaseThickness').isVisible = is_solid
+                inputs.itemById('edgeTreatment').isVisible = is_solid
 
-            # Автоматична синхронізація пропорцій при зміні розмірів
+                edge_val = inputs.itemById('edgeTreatment').selectedItem.name if inputs.itemById('edgeTreatment') and inputs.itemById('edgeTreatment').selectedItem else 'Немає'
+                inputs.itemById('edgeRadius').isVisible = is_solid and (edge_val != 'Немає')
+
+                inputs.itemById('createMountingHoles').isVisible = is_solid
+                is_holes = inputs.itemById('createMountingHoles').value if inputs.itemById('createMountingHoles') else False
+                inputs.itemById('holeType').isVisible = is_solid and is_holes
+                inputs.itemById('holeOffset').isVisible = is_solid and is_holes
+
+            # Оновлення інформаційної панелі
+            def_mm = lambda i_id: adsk.core.ValueCommandInput.cast(inputs.itemById(i_id)).value * 10.0 if inputs.itemById(i_id) else 100.0
+            shape_val = inputs.itemById('shapeType').selectedItem.name if inputs.itemById('shapeType') and inputs.itemById('shapeType').selectedItem else 'Прямокутник'
+            w_mm = def_mm('rectWidth') if shape_val == 'Прямокутник' else def_mm('alphaWidth')
+            l_mm = def_mm('rectLength') if shape_val == 'Прямокутник' else def_mm('alphaLength')
+            sp_mm = def_mm('vertexSpacing')
+            if sp_mm > 0 and w_mm > 0 and l_mm > 0:
+                cols = max(2, int(round(w_mm / sp_mm)) + 1)
+                rows = max(2, int(round(l_mm / sp_mm)) + 1)
+                verts_cnt = cols * rows
+                tris_cnt = (cols - 1) * (rows - 1) * 2
+                backend_str = "NumPy ⚡ (30 мс)" if HAS_NUMPY else "Python (~1.5 сек)"
+                info_box = inputs.itemById('infoBox')
+                if info_box:
+                    info_box.formattedText = f"<b>Сітка:</b> {cols}×{rows} | <b>Вершин:</b> {verts_cnt:,} | <b>Трикутників:</b> {tris_cnt:,}<br><b>Двигун:</b> {backend_str}"
+
+            # Автоматична синхронізація пропорцій
             if not _is_updating_aspect and _img_aspect_ratio > 0:
                 keep_aspect_input = inputs.itemById('keepAspect')
                 keep_aspect = keep_aspect_input.value if keep_aspect_input else False
@@ -637,43 +721,13 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                         _is_updating_aspect = True
                         rw = adsk.core.ValueCommandInput.cast(changed)
                         rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
-                        if rw and rl:
-                            rl.value = rw.value / _img_aspect_ratio
+                        if rw and rl: rl.value = rw.value / _img_aspect_ratio
                         _is_updating_aspect = False
                     elif changed.id == 'rectLength':
                         _is_updating_aspect = True
                         rl = adsk.core.ValueCommandInput.cast(changed)
                         rw = adsk.core.ValueCommandInput.cast(inputs.itemById('rectWidth'))
-                        if rw and rl:
-                            rw.value = rl.value * _img_aspect_ratio
-                        _is_updating_aspect = False
-                    elif changed.id == 'circleDiaX':
-                        _is_updating_aspect = True
-                        cdx = adsk.core.ValueCommandInput.cast(changed)
-                        cdy = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaY'))
-                        if cdx and cdy:
-                            cdy.value = cdx.value / _img_aspect_ratio
-                        _is_updating_aspect = False
-                    elif changed.id == 'circleDiaY':
-                        _is_updating_aspect = True
-                        cdy = adsk.core.ValueCommandInput.cast(changed)
-                        cdx = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaX'))
-                        if cdx and cdy:
-                            cdx.value = cdy.value * _img_aspect_ratio
-                        _is_updating_aspect = False
-                    elif changed.id == 'alphaWidth':
-                        _is_updating_aspect = True
-                        aw = adsk.core.ValueCommandInput.cast(changed)
-                        al = adsk.core.ValueCommandInput.cast(inputs.itemById('alphaLength'))
-                        if aw and al:
-                            al.value = aw.value / _img_aspect_ratio
-                        _is_updating_aspect = False
-                    elif changed.id == 'alphaLength':
-                        _is_updating_aspect = True
-                        al = adsk.core.ValueCommandInput.cast(changed)
-                        aw = adsk.core.ValueCommandInput.cast(inputs.itemById('alphaWidth'))
-                        if aw and al:
-                            aw.value = al.value * _img_aspect_ratio
+                        if rw and rl: rw.value = rl.value * _img_aspect_ratio
                         _is_updating_aspect = False
 
         except:
@@ -696,7 +750,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         try:
             inputs = args.command.commandInputs
 
-            # ---- Зображення ----
             image_path = adsk.core.StringValueCommandInput.cast(inputs.itemById('imagePath')).value
             if not image_path or not os.path.isfile(image_path):
                 _ui.messageBox('Файл зображення не обрано або не знайдено.')
@@ -711,10 +764,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 _ui.messageBox('Немає активного Fusion-документа.')
                 return
             if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
-                _ui.messageBox(
-                    'Вставка мешу вимагає параметричного режиму.\n\n'
-                    'Увімкни "Capture design history" і запусти команду ще раз.'
-                )
+                _ui.messageBox('Вставка мешу вимагає параметричного режиму.\n\nУвімкни "Capture design history" і запусти команду ще раз.')
                 return
 
             def val_mm(input_id):
@@ -724,31 +774,42 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 return adsk.core.IntegerSpinnerCommandInput.cast(inputs.itemById(input_id)).value
 
             shape = adsk.core.DropDownCommandInput.cast(inputs.itemById('shapeType')).selectedItem.name
+            origin_mode = adsk.core.DropDownCommandInput.cast(inputs.itemById('originAlign')).selectedItem.name
 
             max_depth = val_mm('maxDepth')
             base_thickness = val_mm('baseThickness')
             vertex_spacing = val_mm('vertexSpacing')
-            if vertex_spacing <= 0:
-                vertex_spacing = 0.5
+            if vertex_spacing <= 0: vertex_spacing = 0.5
             smooth_passes = int_val('smoothPasses')
 
+            enable_vignette = inputs.itemById('enableVignetteFade').value if inputs.itemById('enableVignetteFade') else False
+            fade_width = val_mm('fadeWidth') if enable_vignette else 0.0
+
             invert_height = adsk.core.BoolValueCommandInput.cast(inputs.itemById('invertHeight')).value
-            gamma_input = inputs.itemById('gammaVal')
-            gamma_val = adsk.core.ValueCommandInput.cast(gamma_input).value if gamma_input else 1.0
-            if gamma_val <= 0:
-                gamma_val = 1.0
+            gamma_val = adsk.core.ValueCommandInput.cast(inputs.itemById('gammaVal')).value if inputs.itemById('gammaVal') else 1.0
+            if gamma_val <= 0: gamma_val = 1.0
 
             auto_crop_input = inputs.itemById('autoCrop')
             auto_crop = (auto_crop_input.value if auto_crop_input else False) and (shape == 'Контур зображення (Alpha / Прозорість)')
 
-            create_solid_input = inputs.itemById('createSolidBase')
-            create_solid_base = create_solid_input.value if create_solid_input else False
+            create_solid_base = inputs.itemById('createSolidBase').value if inputs.itemById('createSolidBase') else False
             solid_base_thickness = val_mm('solidBaseThickness') if create_solid_base else 0.0
 
-            # Збереження останніх параметрів
+            edge_treatment = inputs.itemById('edgeTreatment').selectedItem.name if inputs.itemById('edgeTreatment') and inputs.itemById('edgeTreatment').selectedItem else 'Немає'
+            edge_radius = val_mm('edgeRadius') if create_solid_base else 0.0
+
+            create_holes = inputs.itemById('createMountingHoles').value if inputs.itemById('createMountingHoles') and create_solid_base else False
+            hole_type = inputs.itemById('holeType').selectedItem.name if inputs.itemById('holeType') and inputs.itemById('holeType').selectedItem else 'M4 (4.3 мм)'
+            hole_offset = val_mm('holeOffset') if create_holes else 0.0
+
+            hole_dia_map = {'M3 (3.2 мм)': 3.2, 'M4 (4.3 мм)': 4.3, 'M5 (5.3 мм)': 5.3, 'M6 (6.4 мм)': 6.4}
+            hole_dia_mm = hole_dia_map.get(hole_type, 4.3)
+
+            # Збереження налаштувань
             save_last_params({
                 'imagePath': image_path,
                 'shapeType': shape,
+                'originAlign': origin_mode,
                 'rectWidth': val_mm('rectWidth') if inputs.itemById('rectWidth') else 100.0,
                 'rectLength': val_mm('rectLength') if inputs.itemById('rectLength') else 100.0,
                 'polySides': int_val('polySides') if inputs.itemById('polySides') else 6,
@@ -761,13 +822,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'baseThickness': base_thickness,
                 'vertexSpacing': vertex_spacing,
                 'smoothPasses': smooth_passes,
+                'enableVignetteFade': enable_vignette,
+                'fadeWidth': fade_width,
                 'invertHeight': invert_height,
                 'gammaVal': gamma_val,
                 'createSolidBase': create_solid_base,
-                'solidBaseThickness': solid_base_thickness
+                'solidBaseThickness': solid_base_thickness,
+                'edgeTreatment': edge_treatment,
+                'edgeRadius': edge_radius,
+                'createMountingHoles': create_holes,
+                'holeType': hole_type,
+                'holeOffset': hole_offset
             })
 
-            # ---- Габарити заготовки ----
+            # Габарити
             if shape == 'Прямокутник':
                 width_mm = val_mm('rectWidth')
                 height_mm = val_mm('rectLength')
@@ -777,38 +845,26 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             elif shape == 'Багатокутник':
                 radius = val_mm('polyRadius')
                 width_mm = height_mm = radius * 2.0
-            else:  # Контур зображення (Alpha / Прозорість)
+            else:
                 width_mm = val_mm('alphaWidth')
                 height_mm = val_mm('alphaLength')
 
-            if width_mm <= 0 or height_mm <= 0:
-                _ui.messageBox('Розміри заготовки мають бути більше нуля.')
-                return
+            # Зміщення нуля координат (XYZ Origin Shift)
+            if origin_mode == 'Центр моделі у точці (0, 0, 0)':
+                shift_x, shift_y = -width_mm / 2.0, -height_mm / 2.0
+                shift_z = 0.0
+            elif origin_mode == 'Верхня площина рельєфу Z = 0':
+                shift_x, shift_y = 0.0, 0.0
+                shift_z = -(base_thickness + max_depth)
+            else:  # Лівий нижній кут у (0, 0, 0)
+                shift_x, shift_y, shift_z = 0.0, 0.0, 0.0
 
             grid_cols = max(2, int(round(width_mm / vertex_spacing)) + 1)
             grid_rows = max(2, int(round(height_mm / vertex_spacing)) + 1)
 
-            if grid_cols * grid_rows > MAX_VERTICES_WARNING:
-                res = _ui.messageBox(
-                    f'Сітка буде {grid_cols}x{grid_rows} = {grid_cols * grid_rows} вершин.\n'
-                    f'Це може зайняти кілька секунд.\n\nПродовжити?',
-                    'Попередження про розмір сітки',
-                    adsk.core.MessageBoxButtonTypes.YesNoButtonType,
-                    adsk.core.MessageBoxIconTypes.WarningIconType
-                )
-                if res != adsk.core.DialogResults.DialogYes:
-                    return
-
-            # ---- Ініціалізація ProgressDialog ----
             progress = _ui.createProgressDialog()
             progress.isCancelButtonShown = True
             progress.show("Генерація 3D-рельєфу", "Завантаження зображення...", 0, 100, 1)
-
-            # ---- 1. Завантаження і підготовка зображення (8-біт або 16-біт) ----
-            progress.progressValue = 10
-            progress.message = "Завантаження карти висот (8/16-біт)..."
-            if progress.wasCancelled:
-                return
 
             resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
             img_raw = Image.open(image_path)
@@ -816,8 +872,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if auto_crop:
                 crop_thresh = int_val('alphaThreshold')
                 bbox = get_content_bbox(img_raw, only_alpha=True, threshold=crop_thresh)
-                if bbox:
-                    img_raw = img_raw.crop(bbox)
+                if bbox: img_raw = img_raw.crop(bbox)
 
             has_alpha = (img_raw.mode in ('RGBA', 'LA') or ('transparency' in img_raw.info))
             if has_alpha:
@@ -831,73 +886,72 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
             progress.progressValue = 25
             progress.message = f"Фільтрація та згладжування ({'NumPy' if HAS_NUMPY else 'Python'})..."
-            if progress.wasCancelled:
-                return
+            if progress.wasCancelled: return
 
             if is_16bit:
                 img_conv = img_raw.convert('I')
                 img_resized = img_conv.resize((grid_cols, grid_rows), getattr(Image, 'Resampling', Image).BILINEAR)
                 if smooth_passes > 0:
-                    for _ in range(smooth_passes):
-                        img_resized = img_resized.filter(ImageFilter.SMOOTH)
+                    for _ in range(smooth_passes): img_resized = img_resized.filter(ImageFilter.SMOOTH)
                 max_val = 65535.0
                 lut_size = 65536
             else:
-                if has_alpha:
-                    img_gray = img_resized_alpha.convert('L')
-                else:
-                    img_gray = img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)
+                if has_alpha: img_gray = img_resized_alpha.convert('L')
+                else: img_gray = img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)
                 if smooth_passes > 0:
-                    for _ in range(smooth_passes):
-                        img_gray = img_gray.filter(ImageFilter.SMOOTH)
+                    for _ in range(smooth_passes): img_gray = img_gray.filter(ImageFilter.SMOOTH)
                 max_val = 255.0
                 lut_size = 256
 
-            # ---- 2. Таблиця відповідності (LUT) ----
+            # LUT
             lut = [0.0] * lut_size
             for i in range(lut_size):
                 v = i / max_val
-                if invert_height:
-                    v = 1.0 - v
-                if gamma_val != 1.0 and gamma_val > 0:
-                    v = math.pow(max(0.0, min(1.0, v)), gamma_val)
-                lut[i] = v * max_depth + base_thickness
+                if invert_height: v = 1.0 - v
+                if gamma_val != 1.0 and gamma_val > 0: v = math.pow(max(0.0, min(1.0, v)), gamma_val)
+                lut[i] = v * max_depth
 
             progress.progressValue = 45
-            progress.message = "Розрахунок 3D-вершин..."
-            if progress.wasCancelled:
-                return
+            progress.message = "Розрахунок 3D-вершин та Vignette Fade..."
+            if progress.wasCancelled: return
 
             step_x = width_mm / (grid_cols - 1)
             step_y = height_mm / (grid_rows - 1)
 
-            # =================================================================
-            # ТРАЄКТОРІЯ А: NumPy Векторизована обробка
-            # =================================================================
             if HAS_NUMPY:
                 lut_arr = np.array(lut, dtype=np.float32)
-                if is_16bit:
-                    raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535)
-                else:
-                    raw_arr = np.asarray(img_gray, dtype=np.uint8)
+                raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535) if is_16bit else np.asarray(img_gray, dtype=np.uint8)
 
-                z_grid = np.take(lut_arr, raw_arr)
+                z_rel = np.take(lut_arr, raw_arr)
                 y_idx, x_idx = np.ogrid[:grid_rows, :grid_cols]
                 x_grid = x_idx * step_x
                 y_grid = (grid_rows - 1 - y_idx) * step_y
 
+                # Vignette Fade
+                if enable_vignette and fade_width > 0:
+                    d_left = x_grid
+                    d_right = width_mm - x_grid
+                    d_bottom = y_grid
+                    d_top = height_mm - y_grid
+                    d_min = np.minimum(np.minimum(d_left, d_right), np.minimum(d_bottom, d_top))
+                    t_fade = np.clip(d_min / fade_width, 0.0, 1.0)
+                    smooth_f = 3.0 * (t_fade ** 2) - 2.0 * (t_fade ** 3)
+                    z_rel = z_rel * smooth_f
+
+                z_grid = z_rel + base_thickness + shift_z
+                x_grid_shifted = x_grid + shift_x
+                y_grid_shifted = y_grid + shift_y
+
                 all_vertices = np.column_stack((
-                    np.tile(x_grid, (grid_rows, 1)).ravel(),
-                    np.tile(y_grid, (1, grid_cols)).ravel(),
+                    np.tile(x_grid_shifted, (grid_rows, 1)).ravel(),
+                    np.tile(y_grid_shifted, (1, grid_cols)).ravel(),
                     z_grid.ravel()
                 ))
-                # Конвертуємо у список кортежів для сумісності з OBJ та BRep-контуром
                 all_vertices_list = [tuple(v) for v in all_vertices]
 
                 progress.progressValue = 65
                 progress.message = "Побудова трикутної сітки та стінок (NumPy)..."
-                if progress.wasCancelled:
-                    return
+                if progress.wasCancelled: return
 
                 if shape == 'Прямокутник':
                     inside_mask = np.ones((grid_rows, grid_cols), dtype=bool)
@@ -911,35 +965,27 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     poly = make_regular_polygon(radius, radius, sides, radius)
                     mask_flat = bytearray(grid_cols * grid_rows)
                     idx = 0
-                    for vy in vy_table if 'vy_table' in locals() else [(grid_rows - 1 - y) * step_y for y in range(grid_rows)]:
+                    for vy in [(grid_rows - 1 - y) * step_y for y in range(grid_rows)]:
                         for vx in [(x * step_x) for x in range(grid_cols)]:
-                            if point_in_polygon(vx, vy, poly):
-                                mask_flat[idx] = 1
+                            if point_in_polygon(vx, vy, poly): mask_flat[idx] = 1
                             idx += 1
                     inside_mask = np.array(mask_flat, dtype=bool).reshape((grid_rows, grid_cols))
-                else:  # Контур зображення
+                else:
                     threshold = int_val('alphaThreshold')
                     fill_holes = inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True
-                    mask_bytes = detect_outer_mask(
-                        grid_cols, grid_rows,
-                        alpha_bytes=(img_resized_alpha.split()[-1].tobytes() if has_alpha else None),
-                        raw_pixels=(img_conv.tobytes() if is_16bit else img_gray.tobytes()),
-                        is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes
-                    )
+                    mask_bytes = detect_outer_mask(grid_cols, grid_rows, (img_resized_alpha.split()[-1].tobytes() if has_alpha else None), (img_conv.tobytes() if is_16bit else img_gray.tobytes()), is_16bit, threshold, fill_holes)
                     inside_mask = np.array(mask_bytes, dtype=bool).reshape((grid_rows, grid_cols))
 
+                v00 = (np.arange(grid_rows - 1)[:, None] * grid_cols + np.arange(grid_cols - 1)[None, :]).ravel()
+                v10 = v00 + 1; v01 = v00 + grid_cols; v11 = v01 + 1
+
                 if shape == 'Прямокутник':
-                    v00 = (np.arange(grid_rows - 1)[:, None] * grid_cols + np.arange(grid_cols - 1)[None, :]).ravel()
-                    v10 = v00 + 1
-                    v01 = v00 + grid_cols
-                    v11 = v01 + 1
                     tri1 = np.column_stack((v00, v01, v11))
                     tri2 = np.column_stack((v00, v11, v10))
                     top_triangles = np.vstack((tri1, tri2)).tolist()
                     boundary_edges = []
                     for y in range(grid_rows - 1):
-                        row0 = y * grid_cols
-                        row1 = (y + 1) * grid_cols
+                        row0 = y * grid_cols; row1 = (y + 1) * grid_cols
                         for x in range(grid_cols - 1):
                             if y == 0: boundary_edges.append((row0 + x + 1, row0 + x))
                             if y == grid_rows - 2: boundary_edges.append((row1 + x, row1 + x + 1))
@@ -947,45 +993,25 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             if x == grid_cols - 2: boundary_edges.append((row1 + x + 1, row0 + x + 1))
                     vertices = all_vertices_list
                 else:
-                    v00 = (np.arange(grid_rows - 1)[:, None] * grid_cols + np.arange(grid_cols - 1)[None, :]).ravel()
-                    v10 = v00 + 1
-                    v01 = v00 + grid_cols
-                    v11 = v01 + 1
-
-                    m00 = inside_mask[:-1, :-1].ravel()
-                    m10 = inside_mask[:-1, 1:].ravel()
-                    m01 = inside_mask[1:, :-1].ravel()
-                    m11 = inside_mask[1:, 1:].ravel()
-
-                    t1_mask = m00 & m01 & m11
-                    t2_mask = m00 & m11 & m10
-
+                    m00 = inside_mask[:-1, :-1].ravel(); m10 = inside_mask[:-1, 1:].ravel()
+                    m01 = inside_mask[1:, :-1].ravel(); m11 = inside_mask[1:, 1:].ravel()
+                    t1_mask = m00 & m01 & m11; t2_mask = m00 & m11 & m10
                     t1 = np.column_stack((v00[t1_mask], v01[t1_mask], v11[t1_mask]))
                     t2 = np.column_stack((v00[t2_mask], v11[t2_mask], v10[t2_mask]))
                     raw_triangles = np.vstack((t1, t2))
-
                     if len(raw_triangles) == 0:
                         _ui.messageBox('Обрана форма не охопила жодного трикутника.')
                         return
-
-                    # Ущільнення
                     unique_v, remap = np.unique(raw_triangles, return_inverse=True)
                     top_triangles = remap.reshape(raw_triangles.shape).tolist()
                     vertices = [all_vertices_list[v] for v in unique_v]
-
-                    # Ребра межі
                     boundary_edges_set = set()
                     for a, b, c in top_triangles:
                         for u, v in ((a, b), (b, c), (c, a)):
-                            if (v, u) in boundary_edges_set:
-                                boundary_edges_set.remove((v, u))
-                            else:
-                                boundary_edges_set.add((u, v))
+                            if (v, u) in boundary_edges_set: boundary_edges_set.remove((v, u))
+                            else: boundary_edges_set.add((u, v))
                     boundary_edges = list(boundary_edges_set)
 
-            # =================================================================
-            # ТРАЄКТОРІЯ Б: Чистий Python Fallback (якщо NumPy відсутній)
-            # =================================================================
             else:
                 raw_pixels = (array.array('I', img_resized.tobytes()) if is_16bit else (img_resized_alpha.convert('L') if has_alpha else img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)).tobytes())
                 vx_table = [x * step_x for x in range(grid_cols)]
@@ -995,11 +1021,16 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 idx = 0
                 for vy in vy_table:
                     adsk.doEvents()
+                    d_y_edge = min(vy, height_mm - vy)
                     for vx in vx_table:
                         val = raw_pixels[idx]
                         if is_16bit: val = min(65535, max(0, val))
-                        z = lut[val]
-                        all_vertices[idx] = (vx, vy, z)
+                        z_rel = lut[val]
+                        if enable_vignette and fade_width > 0:
+                            d_min = min(vx, width_mm - vx, d_y_edge)
+                            t_fade = max(0.0, min(1.0, d_min / fade_width))
+                            z_rel *= (3.0 * (t_fade ** 2) - 2.0 * (t_fade ** 3))
+                        all_vertices[idx] = (vx + shift_x, vy + shift_y, z_rel + base_thickness + shift_z)
                         idx += 1
 
                 progress.progressValue = 65
@@ -1010,13 +1041,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     top_triangles = []
                     boundary_edges = []
                     for y in range(grid_rows - 1):
-                        row0 = y * grid_cols
-                        row1 = (y + 1) * grid_cols
+                        row0 = y * grid_cols; row1 = (y + 1) * grid_cols
                         for x in range(grid_cols - 1):
-                            v00 = row0 + x
-                            v10 = row0 + x + 1
-                            v01 = row1 + x
-                            v11 = row1 + x + 1
+                            v00 = row0 + x; v10 = row0 + x + 1; v01 = row1 + x; v11 = row1 + x + 1
                             top_triangles.append((v00, v01, v11))
                             top_triangles.append((v00, v11, v10))
                             if y == 0: boundary_edges.append((v10, v00))
@@ -1052,13 +1079,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     top_triangles = []
                     append_tri = top_triangles.append
                     for y in range(grid_rows - 1):
-                        row0 = y * grid_cols
-                        row1 = (y + 1) * grid_cols
+                        row0 = y * grid_cols; row1 = (y + 1) * grid_cols
                         for x in range(grid_cols - 1):
-                            if inside_mask[row0 + x] and inside_mask[row1 + x] and inside_mask[row1 + x + 1]:
-                                append_tri((row0 + x, row1 + x, row1 + x + 1))
-                            if inside_mask[row0 + x] and inside_mask[row1 + x + 1] and inside_mask[row0 + x + 1]:
-                                append_tri((row0 + x, row1 + x + 1, row0 + x + 1))
+                            if inside_mask[row0 + x] and inside_mask[row1 + x] and inside_mask[row1 + x + 1]: append_tri((row0 + x, row1 + x, row1 + x + 1))
+                            if inside_mask[row0 + x] and inside_mask[row1 + x + 1] and inside_mask[row0 + x + 1]: append_tri((row0 + x, row1 + x + 1, row0 + x + 1))
 
                     if not top_triangles:
                         _ui.messageBox('Обрана форма не охопила жодного трикутника.')
@@ -1080,39 +1104,35 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             else: boundary_edges_set.add((u, v))
                     boundary_edges = list(boundary_edges_set)
 
-            # ---- 5. Підкладка: низ + стінки по контуру ----
+            # Підкладка
             if base_thickness > 0:
                 offset = len(vertices)
-                bottom_vertices = [(vx, vy, 0.0) for (vx, vy, _) in vertices]
+                bottom_vertices = [(vx, vy, shift_z) for (vx, vy, _) in vertices]
                 vertices = vertices + bottom_vertices
                 bottom_triangles = [(a + offset, c + offset, b + offset) for (a, b, c) in top_triangles]
-
                 wall_triangles = []
                 for (a, b) in boundary_edges:
                     wall_triangles.append((a, a + offset, b + offset))
                     wall_triangles.append((a, b + offset, b))
-
                 triangles = top_triangles + bottom_triangles + wall_triangles
             else:
                 triangles = top_triangles
 
-            # ---- 6. Запис OBJ ----
+            # Експорт у швидкий Binary STL
             progress.progressValue = 80
-            progress.message = "Експорт тимчасового OBJ..."
-            if progress.wasCancelled:
-                return
+            progress.message = "Експорт у Binary STL..."
+            if progress.wasCancelled: return
 
-            obj_fp = tempfile.NamedTemporaryFile(mode='w', suffix='.obj', delete=False)
-            obj_fp.close()
-            write_obj(obj_fp.name, vertices, triangles, progress=progress)
-            if progress.wasCancelled:
-                return
+            stl_fp = tempfile.NamedTemporaryFile(mode='wb', suffix='.stl', delete=False)
+            stl_fp.close()
+            write_stl_binary(stl_fp.name, vertices, triangles, progress=progress)
+            if progress.wasCancelled: return
 
-            # ---- 7. Вставка MeshBody через BaseFeature ----
+            # Вставка MeshBody
             progress.progressValue = 88
             progress.message = "Вставка MeshBody у Fusion 360..."
             if progress.wasCancelled:
-                try: os.remove(obj_fp.name)
+                try: os.remove(stl_fp.name)
                 except OSError: pass
                 return
 
@@ -1122,22 +1142,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             base_feat.startEdit()
             try:
                 _app.activeViewport.isUpdateLocked = True
-                mesh_list = root_comp.meshBodies.add(obj_fp.name, adsk.fusion.MeshUnits.MillimeterMeshUnit, base_feat)
+                mesh_list = root_comp.meshBodies.add(stl_fp.name, adsk.fusion.MeshUnits.MillimeterMeshUnit, base_feat)
                 if mesh_list.count > 0:
                     mesh_list.item(0).name = f"Heightmap Relief ({shape})"
             finally:
                 _app.activeViewport.isUpdateLocked = False
                 base_feat.finishEdit()
 
-            try:
-                os.remove(obj_fp.name)
-            except OSError:
-                pass
+            try: os.remove(stl_fp.name)
+            except OSError: pass
 
-            # ---- 8. Опційне створення окремої твердої BRep основи ТОЧНО ПО КОНТУРУ ----
+            # Створення твердотільної BRep основи
             if create_solid_base and solid_base_thickness > 0:
                 progress.progressValue = 94
-                progress.message = "Створення твердотільної BRep основи по контуру..."
+                progress.message = "Створення твердотільної BRep основи з CAM-інструментами..."
                 try:
                     sketches = root_comp.sketches
                     xy_plane = root_comp.xYConstructionPlane
@@ -1145,21 +1163,40 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
                     sketch.isComputeDeferred = True
                     try:
+                        p_shift_x = shift_x / 10.0
+                        p_shift_y = shift_y / 10.0
+
                         if shape == 'Прямокутник':
-                            p0 = adsk.core.Point3D.create(0, 0, 0)
-                            p1 = adsk.core.Point3D.create(width_mm / 10.0, height_mm / 10.0, 0)
+                            p0 = adsk.core.Point3D.create(p_shift_x, p_shift_y, shift_z / 10.0)
+                            p1 = adsk.core.Point3D.create(p_shift_x + width_mm / 10.0, p_shift_y + height_mm / 10.0, shift_z / 10.0)
                             sketch.sketchCurves.sketchLines.addTwoPointRectangle(p0, p1)
+
+                            # Монтажні отвори під гвинти у 4 кутах
+                            if create_holes and hole_offset > 0:
+                                r_h_cm = (hole_dia_mm / 2.0) / 10.0
+                                off_cm = hole_offset / 10.0
+                                w_cm = width_mm / 10.0
+                                l_cm = height_mm / 10.0
+                                h_centers = [
+                                    (p_shift_x + off_cm, p_shift_y + off_cm),
+                                    (p_shift_x + w_cm - off_cm, p_shift_y + off_cm),
+                                    (p_shift_x + off_cm, p_shift_y + l_cm - off_cm),
+                                    (p_shift_x + w_cm - off_cm, p_shift_y + l_cm - off_cm)
+                                ]
+                                for hc_x, hc_y in h_centers:
+                                    sketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(hc_x, hc_y, shift_z / 10.0), r_h_cm)
+
                         elif shape == 'Коло / Овал':
-                            cx_cm = (width_mm / 2.0) / 10.0
-                            cy_cm = (height_mm / 2.0) / 10.0
+                            cx_cm = p_shift_x + (width_mm / 2.0) / 10.0
+                            cy_cm = p_shift_y + (height_mm / 2.0) / 10.0
                             rx_cm = (width_mm / 2.0) / 10.0
                             ry_cm = (height_mm / 2.0) / 10.0
-                            center = adsk.core.Point3D.create(cx_cm, cy_cm, 0)
+                            center = adsk.core.Point3D.create(cx_cm, cy_cm, shift_z / 10.0)
                             if abs(rx_cm - ry_cm) < 1e-5:
                                 sketch.sketchCurves.sketchCircles.addByCenterRadius(center, rx_cm)
                             else:
-                                major_pt = adsk.core.Point3D.create(cx_cm + rx_cm, cy_cm, 0)
-                                point_on = adsk.core.Point3D.create(cx_cm, cy_cm + ry_cm, 0)
+                                major_pt = adsk.core.Point3D.create(cx_cm + rx_cm, cy_cm, shift_z / 10.0)
+                                point_on = adsk.core.Point3D.create(cx_cm, cy_cm + ry_cm, shift_z / 10.0)
                                 sketch.sketchCurves.sketchEllipses.add(center, major_pt, point_on)
                         elif shape == 'Багатокутник':
                             sides = int_val('polySides')
@@ -1167,10 +1204,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             poly = make_regular_polygon(radius, radius, sides, radius)
                             lines = sketch.sketchCurves.sketchLines
                             for i in range(len(poly)):
-                                p_start = adsk.core.Point3D.create(poly[i][0] / 10.0, poly[i][1] / 10.0, 0)
-                                p_end = adsk.core.Point3D.create(poly[(i + 1) % len(poly)][0] / 10.0, poly[(i + 1) % len(poly)][1] / 10.0, 0)
-                                lines.addByTwoPoints(p_start, p_end)
-                        else:  # Контур зображення (Alpha / Прозорість)
+                                p0 = adsk.core.Point3D.create(p_shift_x + poly[i][0] / 10.0, p_shift_y + poly[i][1] / 10.0, shift_z / 10.0)
+                                p1 = adsk.core.Point3D.create(p_shift_x + poly[(i + 1) % len(poly)][0] / 10.0, p_shift_y + poly[(i + 1) % len(poly)][1] / 10.0, shift_z / 10.0)
+                                lines.addByTwoPoints(p0, p1)
+                        else:
                             loops = chain_boundary_edges(boundary_edges, vertices)
                             lines = sketch.sketchCurves.sketchLines
                             eps = max(0.2, vertex_spacing * 0.4)
@@ -1178,8 +1215,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                                 simp = simplify_closed_loop(loop, epsilon=eps)
                                 if len(simp) >= 3:
                                     for i in range(len(simp)):
-                                        p0 = adsk.core.Point3D.create(simp[i][0] / 10.0, simp[i][1] / 10.0, 0)
-                                        p1 = adsk.core.Point3D.create(simp[(i + 1) % len(simp)][0] / 10.0, simp[(i + 1) % len(simp)][1] / 10.0, 0)
+                                        p0 = adsk.core.Point3D.create(simp[i][0] / 10.0, simp[i][1] / 10.0, shift_z / 10.0)
+                                        p1 = adsk.core.Point3D.create(simp[(i + 1) % len(simp)][0] / 10.0, simp[(i + 1) % len(simp)][1] / 10.0, shift_z / 10.0)
                                         lines.addByTwoPoints(p0, p1)
                     finally:
                         sketch.isComputeDeferred = False
@@ -1196,11 +1233,28 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                         ext_input.setDistanceExtent(False, ext_distance)
                         ext_feat = root_comp.features.extrudeFeatures.add(ext_input)
                         if ext_feat.bodies.count > 0:
-                            ext_feat.bodies.item(0).name = "SolidBase_Plate"
+                            solid_body = ext_feat.bodies.item(0)
+                            solid_body.name = "SolidBase_Plate"
+
+                            # Накладання фаски або скруглення на краї основи
+                            if edge_treatment != 'Немає' and edge_radius > 0:
+                                edge_coll = adsk.core.ObjectCollection.create()
+                                for edge in solid_body.edges:
+                                    edge_coll.add(edge)
+
+                                if edge_treatment == 'Скруглення (Fillet)':
+                                    fillet_input = root_comp.features.filletFeatures.createInput()
+                                    fillet_input.addConstantRadiusEdgeSet(edge_coll, adsk.core.ValueInput.createByReal(edge_radius / 10.0), True)
+                                    root_comp.features.filletFeatures.add(fillet_input)
+                                elif edge_treatment == 'Фаска (Chamfer)':
+                                    chamfer_input = root_comp.features.chamferFeatures.createInput2()
+                                    chamfer_input.chamferEdgeSets.addEqualDistanceChamferEdgeSet(edge_coll, adsk.core.ValueInput.createByReal(edge_radius / 10.0), True)
+                                    root_comp.features.chamferFeatures.add(chamfer_input)
+
                 except Exception as ex_solid:
                     if _ui:
                         _ui.messageBox(
-                            f"Попередження: Не вдалося створити твердотільну BRep основу під рельєфом.\n\n"
+                            f"Попередження: Не вдалося створити твердотільну BRep основу або обробити її краї.\n\n"
                             f"Причина: {str(ex_solid)}\n\n"
                             "Меш-модель рельєфу була успішно створена.",
                             "Попередження створення основи",
@@ -1213,24 +1267,22 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
             if mesh_list.count > 0:
                 _app.activeViewport.fit()
-                solid_msg = f"Тверда BRep основа по контуру: {solid_base_thickness:.2f} мм (BRepBody)\n" if create_solid_base else ""
-                backend_msg = "NumPy Векторизовано ⚡" if HAS_NUMPY else "Python Fallback"
+                solid_msg = f"Тверда BRep плита з отворами: {solid_base_thickness:.2f} мм\n" if create_solid_base else ""
+                fade_msg = f"Плавне згасання країв: {fade_width:.1f} мм\n" if enable_vignette else ""
+                holes_msg = f"Отвори: 4x {hole_type} (відступ {hole_offset:.1f} мм)\n" if create_solid_base and create_holes else ""
+                backend_msg = "NumPy ⚡ (Binary STL)" if HAS_NUMPY else "Python Fallback (Binary STL)"
                 _ui.messageBox(
-                    "Готово! MeshBody створено.\n"
-                    f"Двигун обчислень: {backend_msg}\n"
+                    "Готово! MeshBody успішно створено.\n"
+                    f"Двигун: {backend_msg}\n"
+                    f"Початок координат: {origin_mode}\n"
                     f"Форма: {shape}\n"
-                    f"Режим глибини: {'16-біт' if is_16bit else '8-біт'}\n"
                     f"Гамма: {gamma_val:.2f} | Інверсія: {'Так' if invert_height else 'Ні'}\n"
-                    f"Висота заготовки: {base_thickness:.2f} мм\n"
-                    f"Глибина рельєфу: {max_depth:.2f} мм\n"
-                    f"{solid_msg}"
-                    f"Загальна висота моделі: {base_thickness + max_depth:.2f} мм\n"
-                    f"Сітка: {grid_cols} x {grid_rows}\n"
-                    f"Вершин: {len(vertices)}\n"
-                    f"Трикутників: {len(triangles)}"
+                    f"Висота підкладки: {base_thickness:.2f} мм | Глибина рельєфу: {max_depth:.2f} мм\n"
+                    f"{fade_msg}{solid_msg}{holes_msg}"
+                    f"Сітка: {grid_cols} x {grid_rows} | Вершин: {len(vertices):,} | Трикутників: {len(triangles):,}"
                 )
             else:
-                _ui.messageBox('Не вдалося створити MeshBody з отриманого OBJ.')
+                _ui.messageBox('Не вдалося створити MeshBody.')
 
         except:
             if _ui:

@@ -1,0 +1,13 @@
+{
+	"autodeskProduct":	"Fusion360",
+	"type":	"script",
+	"author":	"Antigravity & Badger4",
+	"description":	{
+		"":	"High-Performance Heightmap to MeshBody generator for Fusion 360 with NumPy acceleration, BRep plate, Lithophane mode, and CAM tools."
+	},
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true,
+	"id":	"heightmap_to_mesh_fusion_360",
+	"version":	"2.0.0",
+	"runOnStartup":	false
+}
