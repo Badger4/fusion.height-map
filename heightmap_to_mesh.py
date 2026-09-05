@@ -484,8 +484,10 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             def_l = f"{saved.get('rectLength', 100.0)} mm"
             def_r = f"{saved.get('polyRadius', 50.0)} mm"
 
-            inputs.addValueInput('rectWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
-            inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
+            rect_w = inputs.addValueInput('rectWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
+            rect_w.isVisible = (saved_shape == 'Прямокутник' or saved_shape == 'Контур зображення (Alpha / Прозорість)')
+            rect_l = inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
+            rect_l.isVisible = (saved_shape == 'Прямокутник' or saved_shape == 'Контур зображення (Alpha / Прозорість)')
 
             circle_dx = inputs.addValueInput('circleDiaX', 'Діаметр X (Ширина)', mm, adsk.core.ValueInput.createByString(def_w))
             circle_dx.isVisible = (saved_shape == 'Коло / Овал')
@@ -497,10 +499,6 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             poly_r = inputs.addValueInput('polyRadius', 'Радіус (до вершини)', mm, adsk.core.ValueInput.createByString(def_r))
             poly_r.isVisible = (saved_shape == 'Багатокутник')
 
-            alpha_w = inputs.addValueInput('alphaWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
-            alpha_w.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
-            alpha_l = inputs.addValueInput('alphaLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
-            alpha_l.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
             alpha_thresh = inputs.addIntegerSpinnerCommandInput('alphaThreshold', 'Поріг прозорості (1-254)', 1, 254, 1, saved.get('alphaThreshold', 32))
             alpha_thresh.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
             fill_holes = inputs.addBoolValueInput('fillHoles', 'Суцільна основа (запобігати діркам у тінях)', True, '', saved.get('fillHoles', True))
@@ -603,7 +601,7 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
             shape_dd = inputs.itemById('shapeType')
             if shape_dd and shape_dd.selectedItem:
                 shape = shape_dd.selectedItem.name
-                if shape == 'Прямокутник':
+                if shape in ('Прямокутник', 'Контур зображення (Alpha / Прозорість)'):
                     w = inputs.itemById('rectWidth')
                     l = inputs.itemById('rectLength')
                     if not w or not l or w.value <= 0 or l.value <= 0:
@@ -699,14 +697,12 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 is_poly = (shape == 'Багатокутник')
                 is_alpha = (shape == 'Контур зображення (Alpha / Прозорість)')
 
-                inputs.itemById('rectWidth').isVisible = is_rect
-                inputs.itemById('rectLength').isVisible = is_rect
+                inputs.itemById('rectWidth').isVisible = (is_rect or is_alpha)
+                inputs.itemById('rectLength').isVisible = (is_rect or is_alpha)
                 inputs.itemById('circleDiaX').isVisible = is_circle
                 inputs.itemById('circleDiaY').isVisible = is_circle
                 inputs.itemById('polySides').isVisible = is_poly
                 inputs.itemById('polyRadius').isVisible = is_poly
-                inputs.itemById('alphaWidth').isVisible = is_alpha
-                inputs.itemById('alphaLength').isVisible = is_alpha
                 inputs.itemById('alphaThreshold').isVisible = is_alpha
                 inputs.itemById('fillHoles').isVisible = is_alpha
                 inputs.itemById('autoCrop').isVisible = is_alpha
@@ -865,7 +861,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             })
 
             # Габарити
-            if shape == 'Прямокутник':
+            if shape == 'Прямокутник' or shape == 'Контур зображення (Alpha / Прозорість)':
                 width_mm = val_mm('rectWidth')
                 height_mm = val_mm('rectLength')
             elif shape == 'Коло / Овал':
@@ -874,9 +870,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             elif shape == 'Багатокутник':
                 radius = val_mm('polyRadius')
                 width_mm = height_mm = radius * 2.0
-            else:
-                width_mm = val_mm('alphaWidth')
-                height_mm = val_mm('alphaLength')
 
             # Зміщення нуля координат (XYZ Origin Shift)
             if origin_mode == 'Центр моделі у точці (0, 0, 0)':
