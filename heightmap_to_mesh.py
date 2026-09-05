@@ -323,6 +323,53 @@ def simplify_closed_loop(loop, epsilon=0.2):
     return part1[:-1] + part2[:-1]
 
 
+def gaussian_blur_2d(arr, sigma=1.0):
+    """Швидке та якісне роздільне 2D-гаусове згладжування для NumPy масивів."""
+    if sigma <= 0.0:
+        return arr
+    radius = max(1, int(math.ceil(2.5 * sigma)))
+    x = np.arange(-radius, radius + 1)
+    kernel = np.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+    kernel = kernel.astype(arr.dtype)
+
+    pad_w = [(0, 0), (radius, radius)]
+    padded_r = np.pad(arr, pad_w, mode='edge')
+    res_r = np.zeros_like(arr)
+    for i, k in enumerate(kernel):
+        res_r += k * padded_r[:, i:i + arr.shape[1]]
+
+    pad_h = [(radius, radius), (0, 0)]
+    padded_c = np.pad(res_r, pad_h, mode='edge')
+    res = np.zeros_like(arr)
+    for j, k in enumerate(kernel):
+        res += k * padded_c[j:j + arr.shape[0], :]
+
+    return res
+
+
+def smooth_grid_python(heights, cols, rows, passes=1):
+    """Зважене плаваюче 3x3 згладжування висот для чистого Python-fallback."""
+    curr = list(heights)
+    for _ in range(passes):
+        nxt = list(curr)
+        for y in range(rows):
+            row = y * cols
+            y_prev = max(0, y - 1) * cols
+            y_next = min(rows - 1, y + 1) * cols
+            for x in range(cols):
+                x_prev = max(0, x - 1)
+                x_next = min(cols - 1, x + 1)
+                val = (
+                    curr[y_prev + x_prev] + curr[y_prev + x] * 2.0 + curr[y_prev + x_next] +
+                    curr[row + x_prev] * 2.0 + curr[row + x] * 4.0 + curr[row + x_next] * 2.0 +
+                    curr[y_next + x_prev] + curr[y_next + x] * 2.0 + curr[y_next + x_next]
+                ) / 16.0
+                nxt[row + x] = val
+        curr = nxt
+    return curr
+
+
 # =====================================================================
 # Швидкий Binary STL експортер
 # =====================================================================
@@ -504,7 +551,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             inputs.addValueInput('maxDepth', 'Глибина рельєфу (макс. висота)', mm, adsk.core.ValueInput.createByString(f"{saved.get('maxDepth', 2.0)} mm"))
             inputs.addValueInput('baseThickness', 'Висота заготовки (товщина підкладки, >=0)', mm, adsk.core.ValueInput.createByString(f"{saved.get('baseThickness', 5.0)} mm"))
             inputs.addValueInput('vertexSpacing', 'Крок сітки (деталізація)', mm, adsk.core.ValueInput.createByString(f"{saved.get('vertexSpacing', 0.5)} mm"))
-            inputs.addIntegerSpinnerCommandInput('smoothPasses', 'Проходи згладжування', 0, 10, 1, saved.get('smoothPasses', 1))
+            inputs.addIntegerSpinnerCommandInput('smoothPasses', 'Згладжування рельєфу (0 = вимк, 1-10)', 0, 10, 1, saved.get('smoothPasses', 1))
 
             # Плавний згасаючий край (Vignette Fade)
             enable_fade = inputs.addBoolValueInput('enableVignetteFade', 'Плавне згасання країв до основи (Vignette Fade)', True, '', saved.get('enableVignetteFade', False))
@@ -901,15 +948,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if is_16bit:
                 img_conv = img_raw.convert('I')
                 img_resized = img_conv.resize((grid_cols, grid_rows), getattr(Image, 'Resampling', Image).BILINEAR)
-                if smooth_passes > 0:
-                    for _ in range(smooth_passes): img_resized = img_resized.filter(ImageFilter.SMOOTH)
                 max_val = 65535.0
                 lut_size = 65536
             else:
                 if has_alpha: img_gray = img_resized_alpha.convert('L')
                 else: img_gray = img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)
-                if smooth_passes > 0:
-                    for _ in range(smooth_passes): img_gray = img_gray.filter(ImageFilter.SMOOTH)
                 max_val = 255.0
                 lut_size = 256
 
@@ -933,6 +976,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535) if is_16bit else np.asarray(img_gray, dtype=np.uint8)
 
                 z_rel = np.take(lut_arr, raw_arr)
+
+                # Реальне плаваюче 2D-гаусове згладжування висот
+                if smooth_passes > 0:
+                    sigma_val = float(smooth_passes) * 0.9 + 0.3
+                    z_rel = gaussian_blur_2d(z_rel, sigma=sigma_val)
                 y_idx, x_idx = np.ogrid[:grid_rows, :grid_cols]
                 x_grid = x_idx * step_x
                 y_grid = (grid_rows - 1 - y_idx) * step_y
@@ -1027,15 +1075,17 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 vx_table = [x * step_x for x in range(grid_cols)]
                 vy_table = [(grid_rows - 1 - y) * step_y for y in range(grid_rows)]
 
+                all_z = [lut[min(65535, max(0, raw_pixels[i])) if is_16bit else raw_pixels[i]] for i in range(grid_cols * grid_rows)]
+                if smooth_passes > 0:
+                    all_z = smooth_grid_python(all_z, grid_cols, grid_rows, passes=smooth_passes)
+
                 all_vertices = [None] * (grid_cols * grid_rows)
                 idx = 0
                 for vy in vy_table:
                     adsk.doEvents()
                     d_y_edge = min(vy, height_mm - vy)
                     for vx in vx_table:
-                        val = raw_pixels[idx]
-                        if is_16bit: val = min(65535, max(0, val))
-                        z_rel = lut[val]
+                        z_rel = all_z[idx]
                         if enable_vignette and fade_width > 0:
                             d_min = min(vx, width_mm - vx, d_y_edge)
                             t_fade = max(0.0, min(1.0, d_min / fade_width))
