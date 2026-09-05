@@ -338,19 +338,8 @@ def write_stl_binary(path, vertices, triangles, progress=None):
         f.write(struct.pack('<I', n_triangles))
 
         if HAS_NUMPY:
-            v_arr = np.array(vertices, dtype=np.float32)
-            t_arr = np.array(triangles, dtype=np.int32)
-
-            v1 = v_arr[t_arr[:, 0]]
-            v2 = v_arr[t_arr[:, 1]]
-            v3 = v_arr[t_arr[:, 2]]
-
-            e1 = v2 - v1
-            e2 = v3 - v1
-            normals = np.cross(e1, e2)
-            norms = np.linalg.norm(normals, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            normals /= norms
+            v_arr = np.ascontiguousarray(vertices, dtype=np.float32)
+            t_arr = np.ascontiguousarray(triangles, dtype=np.int32)
 
             tri_dtype = np.dtype([
                 ('normal', 'f4', (3,)),
@@ -360,10 +349,9 @@ def write_stl_binary(path, vertices, triangles, progress=None):
                 ('attr', 'u2')
             ])
             data = np.zeros(n_triangles, dtype=tri_dtype)
-            data['normal'] = normals
-            data['v1'] = v1
-            data['v2'] = v2
-            data['v3'] = v3
+            data['v1'] = v_arr[t_arr[:, 0]]
+            data['v2'] = v_arr[t_arr[:, 1]]
+            data['v3'] = v_arr[t_arr[:, 2]]
 
             for i in range(0, n_triangles, chunk_size):
                 if progress and progress.wasCancelled:
@@ -888,7 +876,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             progress.isCancelButtonShown = True
             progress.show("Генерація 3D-рельєфу", "Завантаження зображення...", 0, 100, 1)
 
-            resample_filter = getattr(Image, 'Resampling', Image).LANCZOS
+            resample_filter = getattr(Image, 'Resampling', Image).BILINEAR
             img_raw = Image.open(image_path)
 
             if auto_crop:
