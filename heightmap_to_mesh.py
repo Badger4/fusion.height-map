@@ -210,6 +210,76 @@ def get_content_bbox(img, only_alpha=True, threshold=32):
         return None
 
 
+def get_aspect_ratio_value(aspect_str, img_aspect):
+    if aspect_str == '1:1 (Квадрат / Коло)':
+        return 1.0
+    elif aspect_str == '4:3 (Стандарт)':
+        return 4.0 / 3.0
+    elif aspect_str == '16:9 (Широкий)':
+        return 16.0 / 9.0
+    elif aspect_str == '3:2 (Фото)':
+        return 3.0 / 2.0
+    elif aspect_str == 'За пропорціями картинки (Оригінал)':
+        return img_aspect if img_aspect > 0 else 1.0
+    return None  # 'Довільне (Вручну)'
+
+
+def fit_image_to_grid(img, target_cols, target_rows, fit_mode='Вписати зі збереженням пропорцій (Fit)', bg_color=None):
+    from PIL import Image
+    resample_filter = getattr(Image, 'Resampling', Image).BILINEAR
+    if fit_mode == 'Розтягнути по формі (Stretch)':
+        return img.resize((target_cols, target_rows), resample_filter)
+
+    src_w, src_h = img.size
+    if src_w <= 0 or src_h <= 0 or target_cols <= 0 or target_rows <= 0:
+        return img.resize((target_cols, target_rows), resample_filter)
+
+    src_aspect = float(src_w) / float(src_h)
+    tgt_aspect = float(target_cols) / float(target_rows)
+
+    if 'Вписати' in fit_mode:
+        if src_aspect > tgt_aspect:
+            new_w = target_cols
+            new_h = max(1, int(round(target_cols / src_aspect)))
+        else:
+            new_h = target_rows
+            new_w = max(1, int(round(target_rows * src_aspect)))
+
+        scaled = img.resize((new_w, new_h), resample_filter)
+        if bg_color is None:
+            if img.mode in ('RGBA', 'LA') or ('transparency' in img.info):
+                bg_color = (0, 0, 0, 0)
+            elif img.mode == 'RGB':
+                c = [img.getpixel((0, 0)), img.getpixel((src_w - 1, 0)), img.getpixel((0, src_h - 1)), img.getpixel((src_w - 1, src_h - 1))]
+                bg_color = (int(statistics.median([p[0] for p in c])), int(statistics.median([p[1] for p in c])), int(statistics.median([p[2] for p in c])))
+            elif img.mode in ('L', 'I', 'I;16', 'I;16L', 'I;16B'):
+                c = [img.getpixel((0, 0)), img.getpixel((src_w - 1, 0)), img.getpixel((0, src_h - 1)), img.getpixel((src_w - 1, src_h - 1))]
+                bg_color = int(statistics.median(c))
+            else:
+                bg_color = 0
+
+        canvas = Image.new(img.mode, (target_cols, target_rows), bg_color)
+        off_x = (target_cols - new_w) // 2
+        off_y = (target_rows - new_h) // 2
+        canvas.paste(scaled, (off_x, off_y))
+        return canvas
+
+    elif 'Заповнити' in fit_mode:
+        if src_aspect > tgt_aspect:
+            new_h = target_rows
+            new_w = max(1, int(round(target_rows * src_aspect)))
+        else:
+            new_w = target_cols
+            new_h = max(1, int(round(target_cols / src_aspect)))
+
+        scaled = img.resize((new_w, new_h), resample_filter)
+        off_x = max(0, (new_w - target_cols) // 2)
+        off_y = max(0, (new_h - target_rows) // 2)
+        return scaled.crop((off_x, off_y, off_x + target_cols, off_y + target_rows))
+
+    return img.resize((target_cols, target_rows), resample_filter)
+
+
 def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_bytes=None, raw_pixels=None, is_16bit=False, threshold=32, fill_holes=True):
     total = grid_cols * grid_rows
 
@@ -614,12 +684,32 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             info_text.isFullWidth = True
 
             # ---- Зображення ----
-            img_input = inputs.addStringValueInput('imagePath', 'Файл зображення', saved.get('imagePath', ''))
+            init_img_path = saved.get('imagePath', '')
+            img_input = inputs.addStringValueInput('imagePath', 'Файл зображення', init_img_path)
             img_input.isReadOnly = True
             inputs.addBoolValueInput('browseBtn', 'Обрати зображення...', False, '', False)
             auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати поля навколо об\'єкта (Alpha / Колір фону)', True, '', saved.get('autoCrop', False))
             auto_crop.isVisible = False
-            inputs.addBoolValueInput('keepAspect', 'Зберігати пропорції (Aspect Ratio)', True, '', saved.get('keepAspect', True))
+
+            if init_img_path and os.path.isfile(init_img_path):
+                try:
+                    from PIL import Image
+                    with Image.open(init_img_path) as _init_im:
+                        if _init_im.size[1] > 0:
+                            _img_aspect_ratio = float(_init_im.size[0]) / float(_init_im.size[1])
+                except:
+                    pass
+
+            # Співвідношення сторін та масштабування
+            aspect_dd = inputs.addDropDownCommandInput('aspectRatio', 'Співвідношення сторін', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_aspect = saved.get('aspectRatio', 'За пропорціями картинки (Оригінал)')
+            for a_name in ['За пропорціями картинки (Оригінал)', '1:1 (Квадрат / Коло)', '4:3 (Стандарт)', '16:9 (Широкий)', '3:2 (Фото)', 'Довільне (Вручну)']:
+                aspect_dd.listItems.add(a_name, a_name == saved_aspect, '')
+
+            fit_dd = inputs.addDropDownCommandInput('fitMode', 'Масштабування картинки', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_fit = saved.get('fitMode', 'Вписати зі збереженням пропорцій (Fit)')
+            for f_name in ['Вписати зі збереженням пропорцій (Fit)', 'Заповнити (Fill / Обрізка)', 'Розтягнути по формі (Stretch)']:
+                fit_dd.listItems.add(f_name, f_name == saved_fit, '')
 
             # Пресет Літофанії
             inputs.addBoolValueInput('presetLithophane', '⚡ Застосувати пресет «Літофанія» (для 3D-друку картинок)', False, '', False)
@@ -627,18 +717,22 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             # ---- Форма заготовки ----
             shape_dd = inputs.addDropDownCommandInput('shapeType', 'Форма заготовки', adsk.core.DropDownStyles.TextListDropDownStyle)
             saved_shape = saved.get('shapeType', 'Прямокутник')
-            for s_name in ['Прямокутник', 'Коло / Овал', 'Багатокутник', 'Контур зображення (Alpha / Колір фону)']:
-                is_sel = (s_name == saved_shape) or (saved_shape.startswith('Контур зображення') and s_name.startswith('Контур зображення'))
+            for s_name in ['Прямокутник', 'Коло', 'Овал', 'Багатокутник', 'Контур зображення (Alpha / Колір фону)']:
+                is_sel = (s_name == saved_shape) or (saved_shape in ('Коло / Овал', 'Коло') and s_name == 'Коло') or (saved_shape.startswith('Контур зображення') and s_name.startswith('Контур зображення'))
                 shape_dd.listItems.add(s_name, is_sel, '')
 
             mm = 'mm'
             def_w = f"{saved.get('rectWidth', 100.0)} mm"
             def_l = f"{saved.get('rectLength', 100.0)} mm"
+            def_dia = f"{saved.get('circleDia', saved.get('rectWidth', 100.0))} mm"
+            def_dx = f"{saved.get('circleDiaX', 100.0)} mm"
+            def_dy = f"{saved.get('circleDiaY', 100.0)} mm"
             def_r = f"{saved.get('polyRadius', 50.0)} mm"
 
             is_contour_init = saved_shape.startswith('Контур зображення')
             is_rect_init = (saved_shape == 'Прямокутник')
-            is_circle_init = (saved_shape == 'Коло / Овал')
+            is_circle_init = (saved_shape in ('Коло', 'Коло / Овал'))
+            is_oval_init = (saved_shape == 'Овал')
             is_poly_init = (saved_shape == 'Багатокутник')
             drop_bg_init = saved.get('dropBackground', True)
 
@@ -646,11 +740,15 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             rect_w.isVisible = (is_rect_init or is_contour_init)
             rect_l = inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
             rect_l.isVisible = (is_rect_init or is_contour_init)
+            aspect_dd.isVisible = (is_rect_init or is_contour_init or is_oval_init)
 
-            circle_dx = inputs.addValueInput('circleDiaX', 'Діаметр X (Ширина)', mm, adsk.core.ValueInput.createByString(def_w))
-            circle_dx.isVisible = is_circle_init
-            circle_dy = inputs.addValueInput('circleDiaY', 'Діаметр Y (Довжина)', mm, adsk.core.ValueInput.createByString(def_l))
-            circle_dy.isVisible = is_circle_init
+            circle_d = inputs.addValueInput('circleDia', 'Діаметр кола', mm, adsk.core.ValueInput.createByString(def_dia))
+            circle_d.isVisible = is_circle_init
+
+            circle_dx = inputs.addValueInput('circleDiaX', 'Діаметр X (Ширина)', mm, adsk.core.ValueInput.createByString(def_dx))
+            circle_dx.isVisible = is_oval_init
+            circle_dy = inputs.addValueInput('circleDiaY', 'Діаметр Y (Довжина)', mm, adsk.core.ValueInput.createByString(def_dy))
+            circle_dy.isVisible = is_oval_init
 
             poly_sides = inputs.addIntegerSpinnerCommandInput('polySides', 'Кількість граней', 3, 36, 1, saved.get('polySides', 6))
             poly_sides.isVisible = is_poly_init
@@ -768,6 +866,17 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
                     if not w or not l or w.value <= 0 or l.value <= 0:
                         args.areInputsValid = False
                         return
+                elif shape == 'Коло':
+                    d = inputs.itemById('circleDia')
+                    if not d or d.value <= 0:
+                        args.areInputsValid = False
+                        return
+                elif shape in ('Овал', 'Коло / Овал'):
+                    dx = inputs.itemById('circleDiaX')
+                    dy = inputs.itemById('circleDiaY')
+                    if not dx or not dy or dx.value <= 0 or dy.value <= 0:
+                        args.areInputsValid = False
+                        return
 
             create_solid_input = inputs.itemById('createSolidBase')
             if create_solid_input and create_solid_input.value:
@@ -837,8 +946,9 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                                 if ph > 0:
                                     _img_aspect_ratio = float(pw) / float(ph)
 
-                                    keep_aspect = adsk.core.BoolValueCommandInput.cast(inputs.itemById('keepAspect')).value
-                                    if keep_aspect:
+                                    aspect_input = inputs.itemById('aspectRatio')
+                                    aspect_name = aspect_input.selectedItem.name if aspect_input and aspect_input.selectedItem else 'За пропорціями картинки (Оригінал)'
+                                    if aspect_name == 'За пропорціями картинки (Оригінал)':
                                         _is_updating_aspect = True
                                         rw = adsk.core.ValueCommandInput.cast(inputs.itemById('rectWidth'))
                                         rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
@@ -854,14 +964,20 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 dd = adsk.core.DropDownCommandInput.cast(changed)
                 shape = dd.selectedItem.name
                 is_rect = (shape == 'Прямокутник')
-                is_circle = (shape == 'Коло / Овал')
+                is_circle = (shape == 'Коло')
+                is_oval = (shape in ('Овал', 'Коло / Овал'))
                 is_poly = (shape == 'Багатокутник')
                 is_alpha = shape.startswith('Контур зображення')
 
                 inputs.itemById('rectWidth').isVisible = (is_rect or is_alpha)
                 inputs.itemById('rectLength').isVisible = (is_rect or is_alpha)
-                inputs.itemById('circleDiaX').isVisible = is_circle
-                inputs.itemById('circleDiaY').isVisible = is_circle
+                if inputs.itemById('aspectRatio'):
+                    inputs.itemById('aspectRatio').isVisible = (is_rect or is_alpha or is_oval)
+
+                if inputs.itemById('circleDia'):
+                    inputs.itemById('circleDia').isVisible = is_circle
+                inputs.itemById('circleDiaX').isVisible = is_oval
+                inputs.itemById('circleDiaY').isVisible = is_oval
                 inputs.itemById('polySides').isVisible = is_poly
                 inputs.itemById('polyRadius').isVisible = is_poly
 
@@ -881,6 +997,57 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 if not is_alpha and inputs.itemById('alphaThreshold'):
                     inputs.itemById('alphaThreshold').isVisible = changed.value
 
+            # Перемикання співвідношення сторін або зміна розмірів
+            if changed.id == 'aspectRatio':
+                dd = adsk.core.DropDownCommandInput.cast(changed)
+                aspect_name = dd.selectedItem.name if dd.selectedItem else ''
+                ratio = get_aspect_ratio_value(aspect_name, _img_aspect_ratio)
+                if ratio is not None and ratio > 0:
+                    _is_updating_aspect = True
+                    rw = adsk.core.ValueCommandInput.cast(inputs.itemById('rectWidth'))
+                    rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
+                    if rw and rl:
+                        rl.value = rw.value / ratio
+                    dx = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaX'))
+                    dy = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaY'))
+                    if dx and dy:
+                        dy.value = dx.value / ratio
+                    _is_updating_aspect = False
+
+            if not _is_updating_aspect:
+                aspect_input = inputs.itemById('aspectRatio')
+                aspect_name = aspect_input.selectedItem.name if aspect_input and aspect_input.selectedItem else 'Довільне (Вручну)'
+                ratio = get_aspect_ratio_value(aspect_name, _img_aspect_ratio)
+                if ratio is not None and ratio > 0:
+                    if changed.id == 'rectWidth':
+                        _is_updating_aspect = True
+                        rw = adsk.core.ValueCommandInput.cast(changed)
+                        rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
+                        if rw and rl:
+                            rl.value = rw.value / ratio
+                        _is_updating_aspect = False
+                    elif changed.id == 'rectLength':
+                        _is_updating_aspect = True
+                        rl = adsk.core.ValueCommandInput.cast(changed)
+                        rw = adsk.core.ValueCommandInput.cast(inputs.itemById('rectWidth'))
+                        if rw and rl:
+                            rw.value = rl.value * ratio
+                        _is_updating_aspect = False
+                    elif changed.id == 'circleDiaX':
+                        _is_updating_aspect = True
+                        dx = adsk.core.ValueCommandInput.cast(changed)
+                        dy = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaY'))
+                        if dx and dy:
+                            dy.value = dx.value / ratio
+                        _is_updating_aspect = False
+                    elif changed.id == 'circleDiaY':
+                        _is_updating_aspect = True
+                        dy = adsk.core.ValueCommandInput.cast(changed)
+                        dx = adsk.core.ValueCommandInput.cast(inputs.itemById('circleDiaX'))
+                        if dx and dy:
+                            dx.value = dy.value * ratio
+                        _is_updating_aspect = False
+
             # Перемикання твердотільної основи та CAM інструментів
             if changed.id == 'createSolidBase' or changed.id == 'createMountingHoles' or changed.id == 'edgeTreatment':
                 is_solid = adsk.core.BoolValueCommandInput.cast(inputs.itemById('createSolidBase')).value
@@ -898,7 +1065,9 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
             # Оновлення інформаційної панелі
             def_mm = lambda i_id: adsk.core.ValueCommandInput.cast(inputs.itemById(i_id)).value * 10.0 if inputs.itemById(i_id) else 100.0
             shape_val = inputs.itemById('shapeType').selectedItem.name if inputs.itemById('shapeType') and inputs.itemById('shapeType').selectedItem else 'Прямокутник'
-            if shape_val == 'Коло / Овал':
+            if shape_val == 'Коло':
+                w_mm = l_mm = def_mm('circleDia')
+            elif shape_val in ('Овал', 'Коло / Овал'):
                 w_mm = def_mm('circleDiaX')
                 l_mm = def_mm('circleDiaY')
             elif shape_val == 'Багатокутник':
@@ -916,24 +1085,6 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 info_box = inputs.itemById('infoBox')
                 if info_box:
                     info_box.formattedText = f"<b>Сітка:</b> {cols}×{rows} | <b>Вершин:</b> {verts_cnt:,} | <b>Трикутників:</b> {tris_cnt:,}<br><b>Двигун:</b> {backend_str}"
-
-            # Автоматична синхронізація пропорцій
-            if not _is_updating_aspect and _img_aspect_ratio > 0:
-                keep_aspect_input = inputs.itemById('keepAspect')
-                keep_aspect = keep_aspect_input.value if keep_aspect_input else False
-                if keep_aspect:
-                    if changed.id == 'rectWidth':
-                        _is_updating_aspect = True
-                        rw = adsk.core.ValueCommandInput.cast(changed)
-                        rl = adsk.core.ValueCommandInput.cast(inputs.itemById('rectLength'))
-                        if rw and rl: rl.value = rw.value / _img_aspect_ratio
-                        _is_updating_aspect = False
-                    elif changed.id == 'rectLength':
-                        _is_updating_aspect = True
-                        rl = adsk.core.ValueCommandInput.cast(changed)
-                        rw = adsk.core.ValueCommandInput.cast(inputs.itemById('rectWidth'))
-                        if rw and rl: rw.value = rl.value * _img_aspect_ratio
-                        _is_updating_aspect = False
 
         except:
             if _ui:
@@ -1010,6 +1161,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             hole_dia_map = {'M3 (3.2 мм)': 3.2, 'M4 (4.3 мм)': 4.3, 'M5 (5.3 мм)': 5.3, 'M6 (6.4 мм)': 6.4}
             hole_dia_mm = hole_dia_map.get(hole_type, 4.3)
 
+            fit_mode_input = inputs.itemById('fitMode')
+            fit_mode = fit_mode_input.selectedItem.name if fit_mode_input and fit_mode_input.selectedItem else 'Вписати зі збереженням пропорцій (Fit)'
+
             # Збереження налаштувань
             save_last_params({
                 'imagePath': image_path,
@@ -1017,13 +1171,17 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'originAlign': origin_mode,
                 'rectWidth': val_mm('rectWidth') if inputs.itemById('rectWidth') else 100.0,
                 'rectLength': val_mm('rectLength') if inputs.itemById('rectLength') else 100.0,
+                'circleDia': val_mm('circleDia') if inputs.itemById('circleDia') else 100.0,
+                'circleDiaX': val_mm('circleDiaX') if inputs.itemById('circleDiaX') else 100.0,
+                'circleDiaY': val_mm('circleDiaY') if inputs.itemById('circleDiaY') else 100.0,
                 'polySides': int_val('polySides') if inputs.itemById('polySides') else 6,
                 'polyRadius': val_mm('polyRadius') if inputs.itemById('polyRadius') else 50.0,
                 'alphaThreshold': int_val('alphaThreshold') if inputs.itemById('alphaThreshold') else 32,
                 'fillHoles': inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True,
                 'dropBackground': inputs.itemById('dropBackground').value if inputs.itemById('dropBackground') else True,
                 'autoCrop': inputs.itemById('autoCrop').value if inputs.itemById('autoCrop') else False,
-                'keepAspect': inputs.itemById('keepAspect').value if inputs.itemById('keepAspect') else True,
+                'aspectRatio': inputs.itemById('aspectRatio').selectedItem.name if inputs.itemById('aspectRatio') and inputs.itemById('aspectRatio').selectedItem else 'За пропорціями картинки (Оригінал)',
+                'fitMode': fit_mode,
                 'maxDepth': max_depth,
                 'baseThickness': base_thickness,
                 'vertexSpacing': vertex_spacing,
@@ -1045,7 +1203,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if shape == 'Прямокутник' or shape.startswith('Контур зображення'):
                 width_mm = val_mm('rectWidth')
                 height_mm = val_mm('rectLength')
-            elif shape == 'Коло / Овал':
+            elif shape == 'Коло':
+                width_mm = height_mm = val_mm('circleDia')
+            elif shape in ('Овал', 'Коло / Овал'):
                 width_mm = val_mm('circleDiaX')
                 height_mm = val_mm('circleDiaY')
             elif shape == 'Багатокутник':
@@ -1080,7 +1240,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             has_alpha = (img_raw.mode in ('RGBA', 'LA') or ('transparency' in img_raw.info))
             if has_alpha:
                 img_rgba = img_raw.convert('RGBA')
-                img_resized_alpha = img_rgba.resize((grid_cols, grid_rows), resample_filter)
+                img_resized_alpha = fit_image_to_grid(img_rgba, grid_cols, grid_rows, fit_mode=fit_mode)
                 alpha_bytes = img_resized_alpha.split()[-1].tobytes()
             else:
                 alpha_bytes = None
@@ -1093,7 +1253,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
             if is_16bit:
                 img_conv = img_raw.convert('I')
-                img_resized = img_conv.resize((grid_cols, grid_rows), getattr(Image, 'Resampling', Image).BILINEAR)
+                img_resized = fit_image_to_grid(img_conv, grid_cols, grid_rows, fit_mode=fit_mode)
                 max_val = 65535.0
                 lut_size = 65536
                 img_resized_rgb = None
@@ -1104,7 +1264,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     img_gray = img_resized_alpha.convert('L')
                     img_resized_rgb = img_resized_alpha.convert('RGB')
                 else:
-                    img_resized_rgb = img_raw.convert('RGB').resize((grid_cols, grid_rows), resample_filter)
+                    img_rgb = img_raw.convert('RGB')
+                    img_resized_rgb = fit_image_to_grid(img_rgb, grid_cols, grid_rows, fit_mode=fit_mode)
                     img_gray = img_resized_rgb.convert('L')
                 max_val = 255.0
                 lut_size = 256
@@ -1162,7 +1323,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 if smooth_passes > 0:
                     sigma_val = float(smooth_passes) * 0.9 + 0.3
                     z_rel = gaussian_blur_2d(z_rel, sigma=sigma_val)
-                    if bg_object_mask is not None and drop_bg and shape == 'Прямокутник':
+                    if bg_object_mask is not None and drop_bg:
                         z_rel[~bg_object_mask] = 0.0
 
                 y_idx, x_idx = np.ogrid[:grid_rows, :grid_cols]
@@ -1197,7 +1358,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
                 if shape == 'Прямокутник':
                     inside_mask = np.ones((grid_rows, grid_cols), dtype=bool)
-                elif shape == 'Коло / Овал':
+                elif shape == 'Коло':
+                    cx, cy = width_mm / 2.0, height_mm / 2.0
+                    r = width_mm / 2.0
+                    inside_mask = (((x_grid - cx) ** 2 + (y_grid - cy) ** 2) <= (r ** 2 + 1e-6))
+                elif shape in ('Овал', 'Коло / Овал'):
                     cx, cy = width_mm / 2.0, height_mm / 2.0
                     rx, ry = width_mm / 2.0, height_mm / 2.0
                     inside_mask = (((x_grid - cx) / rx) ** 2 + ((y_grid - cy) / ry) ** 2) <= (1.0 + 1e-6)
@@ -1269,7 +1434,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
                 if smooth_passes > 0:
                     all_z = smooth_grid_python(all_z, grid_cols, grid_rows, passes=smooth_passes)
-                    if mask_bytes is not None and drop_bg and shape == 'Прямокутник':
+                    if mask_bytes is not None and drop_bg:
                         for i in range(grid_cols * grid_rows):
                             if not mask_bytes[i]:
                                 all_z[i] = 0.0
@@ -1308,7 +1473,16 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     vertices = all_vertices
                 else:
                     inside_mask = bytearray(grid_cols * grid_rows)
-                    if shape == 'Коло / Овал':
+                    if shape == 'Коло':
+                        cx, cy = width_mm / 2.0, height_mm / 2.0
+                        r2 = (width_mm / 2.0) ** 2 + 1e-6
+                        idx = 0
+                        for vy in vy_table:
+                            dy2 = (vy - cy) ** 2
+                            for vx in vx_table:
+                                if (vx - cx) ** 2 + dy2 <= r2: inside_mask[idx] = 1
+                                idx += 1
+                    elif shape in ('Овал', 'Коло / Овал'):
                         cx, cy = width_mm / 2.0, height_mm / 2.0
                         rx, ry = width_mm / 2.0, height_mm / 2.0
                         idx = 0
@@ -1439,7 +1613,22 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                                 for hc_x, hc_y in h_centers:
                                     sketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(hc_x, hc_y, shift_z / 10.0), r_h_cm)
 
-                        elif shape == 'Коло / Овал':
+                        elif shape == 'Коло':
+                            cx_cm = p_shift_x + (width_mm / 2.0) / 10.0
+                            cy_cm = p_shift_y + (height_mm / 2.0) / 10.0
+                            r_cm = (width_mm / 2.0) / 10.0
+                            center = adsk.core.Point3D.create(cx_cm, cy_cm, shift_z / 10.0)
+                            sketch.sketchCurves.sketchCircles.addByCenterRadius(center, r_cm)
+                            if create_holes and hole_offset > 0:
+                                r_h_cm = (hole_dia_mm / 2.0) / 10.0
+                                hole_dist_cm = max(0.1, r_cm - (hole_offset / 10.0))
+                                for angle_deg in [45, 135, 225, 315]:
+                                    ang_rad = math.radians(angle_deg)
+                                    hx = cx_cm + hole_dist_cm * math.cos(ang_rad)
+                                    hy = cy_cm + hole_dist_cm * math.sin(ang_rad)
+                                    sketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(hx, hy, shift_z / 10.0), r_h_cm)
+
+                        elif shape in ('Овал', 'Коло / Овал'):
                             cx_cm = p_shift_x + (width_mm / 2.0) / 10.0
                             cy_cm = p_shift_y + (height_mm / 2.0) / 10.0
                             rx_cm = (width_mm / 2.0) / 10.0
@@ -1451,6 +1640,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                                 major_pt = adsk.core.Point3D.create(cx_cm + rx_cm, cy_cm, shift_z / 10.0)
                                 point_on = adsk.core.Point3D.create(cx_cm, cy_cm + ry_cm, shift_z / 10.0)
                                 sketch.sketchCurves.sketchEllipses.add(center, major_pt, point_on)
+                            if create_holes and hole_offset > 0:
+                                r_h_cm = (hole_dia_mm / 2.0) / 10.0
+                                off_x_cm = max(0.1, rx_cm - (hole_offset / 10.0))
+                                off_y_cm = max(0.1, ry_cm - (hole_offset / 10.0))
+                                for sx, sy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+                                    hx = cx_cm + sx * off_x_cm * 0.7071
+                                    hy = cy_cm + sy * off_y_cm * 0.7071
+                                    sketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(hx, hy, shift_z / 10.0), r_h_cm)
                         elif shape == 'Багатокутник':
                             sides = int_val('polySides')
                             radius = val_mm('polyRadius')
