@@ -280,7 +280,7 @@ def fit_image_to_grid(img, target_cols, target_rows, fit_mode='Вписати з
     return img.resize((target_cols, target_rows), resample_filter)
 
 
-def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_bytes=None, raw_pixels=None, is_16bit=False, threshold=32, fill_holes=True):
+def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_bytes=None, raw_pixels=None, raw_arr=None, is_16bit=False, threshold=32, fill_holes=True):
     total = grid_cols * grid_rows
 
     use_alpha = False
@@ -293,6 +293,44 @@ def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_
         if not fill_holes:
             return bytearray(1 if alpha_bytes[i] >= threshold else 0 for i in range(total))
         is_bg = lambda idx: alpha_bytes[idx] < threshold
+    elif raw_arr is not None and HAS_NUMPY:
+        corners = [raw_arr[0, 0], raw_arr[0, -1], raw_arr[-1, 0], raw_arr[-1, -1]]
+        bg_val = float(np.median(corners))
+        tol = float(threshold * 256.0) if is_16bit else max(25.0, float(threshold))
+
+        corner_dists = np.abs(np.array(corners, dtype=np.float32) - bg_val)
+        has_uniform_bg = (np.sum(corner_dists <= tol) >= 3)
+        if not has_uniform_bg:
+            return bytearray(b'\x01' * total)
+
+        diff = np.abs(raw_arr.astype(np.float32) - bg_val)
+        is_bg_mat = diff <= tol
+
+        if not fill_holes:
+            return bytearray((~is_bg_mat).astype(np.uint8).ravel().tobytes())
+
+        visited = np.zeros((grid_rows, grid_cols), dtype=bool)
+        queue = deque()
+        for x in range(grid_cols):
+            if is_bg_mat[0, x] and not visited[0, x]:
+                visited[0, x] = True; queue.append((0, x))
+            if is_bg_mat[grid_rows - 1, x] and not visited[grid_rows - 1, x]:
+                visited[grid_rows - 1, x] = True; queue.append((grid_rows - 1, x))
+        for y in range(grid_rows):
+            if is_bg_mat[y, 0] and not visited[y, 0]:
+                visited[y, 0] = True; queue.append((y, 0))
+            if is_bg_mat[y, grid_cols - 1] and not visited[y, grid_cols - 1]:
+                visited[y, grid_cols - 1] = True; queue.append((y, grid_cols - 1))
+
+        while queue:
+            cy, cx = queue.popleft()
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < grid_rows and 0 <= nx < grid_cols:
+                    if not visited[ny, nx] and is_bg_mat[ny, nx]:
+                        visited[ny, nx] = True; queue.append((ny, nx))
+
+        is_object = ~visited
+        return bytearray(is_object.astype(np.uint8).ravel().tobytes())
     elif rgb_arr is not None and HAS_NUMPY:
         sample_pts = [
             (0, 0), (grid_rows - 1, 0), (0, grid_cols - 1), (grid_rows - 1, grid_cols - 1),
@@ -364,7 +402,13 @@ def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_
     else:
         corner_indices = [0, grid_cols - 1, (grid_rows - 1) * grid_cols, total - 1]
         if is_16bit and raw_pixels is not None:
-            val_func = lambda i: (raw_pixels[i * 2 + 1] << 8) | raw_pixels[i * 2] if isinstance(raw_pixels, (bytes, bytearray)) else raw_pixels[i]
+            if isinstance(raw_pixels, (bytes, bytearray)):
+                if len(raw_pixels) >= total * 4:
+                    val_func = lambda i: struct.unpack_from('<I', raw_pixels, i * 4)[0]
+                else:
+                    val_func = lambda i: struct.unpack_from('<H', raw_pixels, i * 2)[0]
+            else:
+                val_func = lambda i: raw_pixels[i]
             corner_vals = [val_func(i) for i in corner_indices]
             bg_val = statistics.median(corner_vals)
             tol = threshold * 256
@@ -689,7 +733,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             img_input.isReadOnly = True
             inputs.addBoolValueInput('browseBtn', 'Обрати зображення...', False, '', False)
             auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати поля навколо об\'єкта (Alpha / Колір фону)', True, '', saved.get('autoCrop', False))
-            auto_crop.isVisible = False
+            auto_crop.isVisible = True
 
             if init_img_path and os.path.isfile(init_img_path):
                 try:
@@ -988,7 +1032,7 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
 
                 inputs.itemById('alphaThreshold').isVisible = (is_alpha or drop_bg_val)
                 inputs.itemById('fillHoles').isVisible = is_alpha
-                inputs.itemById('autoCrop').isVisible = is_alpha
+                inputs.itemById('autoCrop').isVisible = True
 
             if changed.id == 'dropBackground':
                 shape_item = inputs.itemById('shapeType').selectedItem if inputs.itemById('shapeType') else None
@@ -1146,7 +1190,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if gamma_val <= 0: gamma_val = 1.0
 
             auto_crop_input = inputs.itemById('autoCrop')
-            auto_crop = (auto_crop_input.value if auto_crop_input else False) and shape.startswith('Контур зображення')
+            auto_crop = auto_crop_input.value if auto_crop_input else False
 
             create_solid_base = inputs.itemById('createSolidBase').value if inputs.itemById('createSolidBase') else False
             solid_base_thickness = val_mm('solidBaseThickness') if create_solid_base else 0.0
@@ -1272,6 +1316,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 rgb_arr = np.asarray(img_resized_rgb, dtype=np.uint8) if HAS_NUMPY else None
                 rgb_bytes = img_resized_rgb.tobytes() if not HAS_NUMPY else None
 
+            # Підготовка масивів пікселів для поточної сітки
+            if HAS_NUMPY:
+                raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535) if is_16bit else np.asarray(img_gray, dtype=np.uint8)
+                raw_pixels = None
+            else:
+                raw_arr = None
+                raw_pixels = (array.array('I', img_resized.tobytes()) if is_16bit else img_gray.tobytes())
+
             # LUT
             lut = [0.0] * lut_size
             for i in range(lut_size):
@@ -1301,7 +1353,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     alpha_bytes=alpha_bytes,
                     rgb_arr=rgb_arr,
                     rgb_bytes=rgb_bytes,
-                    raw_pixels=(img_conv.tobytes() if is_16bit else None),
+                    raw_pixels=raw_pixels,
+                    raw_arr=raw_arr,
                     is_16bit=is_16bit,
                     threshold=threshold,
                     fill_holes=fill_holes
@@ -1311,8 +1364,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
             if HAS_NUMPY:
                 lut_arr = np.array(lut, dtype=np.float32)
-                raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535) if is_16bit else np.asarray(img_gray, dtype=np.uint8)
-
                 z_rel = np.take(lut_arr, raw_arr)
 
                 # Опускаємо колір фону до Z=0
@@ -1381,7 +1432,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     if bg_object_mask is not None:
                         inside_mask = bg_object_mask
                     else:
-                        mask_bytes = detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=rgb_arr, rgb_bytes=rgb_bytes, raw_pixels=(img_conv.tobytes() if is_16bit else None), is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
+                        mask_bytes = detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=rgb_arr, rgb_bytes=rgb_bytes, raw_pixels=raw_pixels, raw_arr=raw_arr, is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
                         inside_mask = np.array(mask_bytes, dtype=bool).reshape((grid_rows, grid_cols))
 
                 v00 = (np.arange(grid_rows - 1)[:, None] * grid_cols + np.arange(grid_cols - 1)[None, :]).ravel()
@@ -1501,7 +1552,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                                 if point_in_polygon(vx, vy, poly): inside_mask[idx] = 1
                                 idx += 1
                     else:
-                        inside_mask = mask_bytes if mask_bytes is not None else detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=None, rgb_bytes=rgb_bytes, raw_pixels=(img_conv.tobytes() if is_16bit else None), is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
+                        inside_mask = mask_bytes if mask_bytes is not None else detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=None, rgb_bytes=rgb_bytes, raw_pixels=raw_pixels, raw_arr=None, is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
 
                     top_triangles = []
                     append_tri = top_triangles.append
