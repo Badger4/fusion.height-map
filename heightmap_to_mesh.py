@@ -30,6 +30,7 @@ import struct
 import tempfile
 import subprocess
 import time
+import statistics
 from collections import deque
 
 try:
@@ -175,75 +176,190 @@ def get_content_bbox(img, only_alpha=True, threshold=32):
     try:
         if img.mode in ('RGBA', 'LA') or ('transparency' in img.info):
             alpha = img.convert('RGBA').split()[-1]
-            mask = alpha.point(lambda p: 255 if p >= threshold else 0)
-            bbox = mask.getbbox()
-            if bbox:
-                return bbox
+            extrema = alpha.getextrema()
+            if extrema and extrema[0] < threshold:
+                mask = alpha.point(lambda p: 255 if p >= threshold else 0)
+                bbox = mask.getbbox()
+                if bbox:
+                    return bbox
 
         if not only_alpha:
-            img_gray = img.convert('L')
-            w, h = img_gray.size
-            pixels = img_gray.tobytes()
-            corners = [pixels[0], pixels[w - 1], pixels[(h - 1) * w], pixels[w * h - 1]]
-            avg_corner = sum(corners) / 4.0
-            if avg_corner < 128:
-                mask = img_gray.point(lambda p: 255 if p > threshold else 0)
+            img_rgb = img.convert('RGB')
+            w, h = img_rgb.size
+            if HAS_NUMPY:
+                arr = np.asarray(img_rgb, dtype=np.float32)
+                corners = [arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]
+                bg = np.median(corners, axis=0)
+                color_tol = max(25.0, float(threshold) * 1.732)
+                diff = arr - bg
+                dist_sq = np.sum(diff * diff, axis=-1)
+                content = dist_sq > (color_tol ** 2)
+                y_idx, x_idx = np.where(content)
+                if len(y_idx) > 0:
+                    return (int(x_idx.min()), int(y_idx.min()), int(x_idx.max()) + 1, int(y_idx.max()) + 1)
             else:
-                mask = img_gray.point(lambda p: 255 if p < (255 - threshold) else 0)
-            return mask.getbbox()
+                img_gray = img.convert('L')
+                pixels = img_gray.tobytes()
+                corners = [pixels[0], pixels[w - 1], pixels[(h - 1) * w], pixels[w * h - 1]]
+                avg_corner = statistics.median(corners)
+                tol = max(25, threshold)
+                mask = img_gray.point(lambda p: 255 if abs(p - avg_corner) > tol else 0)
+                return mask.getbbox()
         return None
     except:
         return None
 
 
-def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, raw_pixels=None, is_16bit=False, threshold=32, fill_holes=True):
+def detect_outer_mask(grid_cols, grid_rows, alpha_bytes=None, rgb_arr=None, rgb_bytes=None, raw_pixels=None, is_16bit=False, threshold=32, fill_holes=True):
     total = grid_cols * grid_rows
+
+    use_alpha = False
     if alpha_bytes is not None:
+        sample_step = max(1, len(alpha_bytes) // 500)
+        if any(alpha_bytes[i] < threshold for i in range(0, len(alpha_bytes), sample_step)):
+            use_alpha = True
+
+    if use_alpha:
         if not fill_holes:
             return bytearray(1 if alpha_bytes[i] >= threshold else 0 for i in range(total))
         is_bg = lambda idx: alpha_bytes[idx] < threshold
-    else:
+    elif rgb_arr is not None and HAS_NUMPY:
+        sample_pts = [
+            (0, 0), (grid_rows - 1, 0), (0, grid_cols - 1), (grid_rows - 1, grid_cols - 1),
+            (grid_rows // 2, 0), (grid_rows // 2, grid_cols - 1),
+            (0, grid_cols // 2), (grid_rows - 1, grid_cols // 2)
+        ]
+        sampled_colors = [rgb_arr[r, c] for (r, c) in sample_pts]
+        bg_color = np.median(sampled_colors, axis=0)
+
+        color_tol = max(25.0, float(threshold) * 1.732)
+        corners = [rgb_arr[0, 0], rgb_arr[-1, 0], rgb_arr[0, -1], rgb_arr[-1, -1]]
+        corner_dists = np.sqrt(np.sum((corners - bg_color) ** 2, axis=-1))
+        has_uniform_bg = (np.sum(corner_dists <= color_tol) >= 3)
+
+        if not has_uniform_bg:
+            return bytearray(b'\x01' * total)
+
+        diff = rgb_arr.astype(np.float32) - bg_color
+        dist_sq = np.sum(diff * diff, axis=-1)
+        is_bg_mat = dist_sq <= (color_tol ** 2)
+
         if not fill_holes:
-            return bytearray(1 if (raw_pixels[i] if not is_16bit else raw_pixels[i] >> 8) >= threshold else 0 for i in range(total))
+            return bytearray(0 if is_bg_mat.ravel()[i] else 1 for i in range(total))
 
+        is_bg_flat = is_bg_mat.ravel()
+        is_bg = lambda idx: bool(is_bg_flat[idx])
+    elif rgb_bytes is not None:
+        sample_indices = [
+            0, (grid_cols - 1),
+            (grid_rows - 1) * grid_cols, total - 1,
+            (grid_rows // 2) * grid_cols, (grid_rows // 2) * grid_cols + (grid_cols - 1),
+            grid_cols // 2, (grid_rows - 1) * grid_cols + (grid_cols // 2)
+        ]
+        r_vals = [rgb_bytes[i * 3] for i in sample_indices]
+        g_vals = [rgb_bytes[i * 3 + 1] for i in sample_indices]
+        b_vals = [rgb_bytes[i * 3 + 2] for i in sample_indices]
+        bg_r = statistics.median(r_vals)
+        bg_g = statistics.median(g_vals)
+        bg_b = statistics.median(b_vals)
+
+        color_tol_sq = (max(25.0, float(threshold) * 1.732)) ** 2
         corner_indices = [0, grid_cols - 1, (grid_rows - 1) * grid_cols, total - 1]
-        if is_16bit:
-            corner_vals = [(raw_pixels[i] >> 8) for i in corner_indices]
-        else:
-            corner_vals = [raw_pixels[i] for i in corner_indices]
-        avg_corner = sum(corner_vals) / 4.0
+        matches = 0
+        for ci in corner_indices:
+            dr = rgb_bytes[ci * 3] - bg_r
+            dg = rgb_bytes[ci * 3 + 1] - bg_g
+            db = rgb_bytes[ci * 3 + 2] - bg_b
+            if (dr * dr + dg * dg + db * db) <= color_tol_sq:
+                matches += 1
 
-        if avg_corner < 128:
-            is_bg = lambda idx: (raw_pixels[idx] >> 8 if is_16bit else raw_pixels[idx]) <= threshold
+        if matches < 3:
+            return bytearray(b'\x01' * total)
+
+        if not fill_holes:
+            res = bytearray(total)
+            for i in range(total):
+                dr = rgb_bytes[i * 3] - bg_r
+                dg = rgb_bytes[i * 3 + 1] - bg_g
+                db = rgb_bytes[i * 3 + 2] - bg_b
+                if (dr * dr + dg * dg + db * db) > color_tol_sq:
+                    res[i] = 1
+            return res
+
+        def is_bg(idx):
+            dr = rgb_bytes[idx * 3] - bg_r
+            dg = rgb_bytes[idx * 3 + 1] - bg_g
+            db = rgb_bytes[idx * 3 + 2] - bg_b
+            return (dr * dr + dg * dg + db * db) <= color_tol_sq
+    else:
+        corner_indices = [0, grid_cols - 1, (grid_rows - 1) * grid_cols, total - 1]
+        if is_16bit and raw_pixels is not None:
+            val_func = lambda i: (raw_pixels[i * 2 + 1] << 8) | raw_pixels[i * 2] if isinstance(raw_pixels, (bytes, bytearray)) else raw_pixels[i]
+            corner_vals = [val_func(i) for i in corner_indices]
+            bg_val = statistics.median(corner_vals)
+            tol = threshold * 256
+            if not fill_holes:
+                return bytearray(1 if abs(val_func(i) - bg_val) > tol else 0 for i in range(total))
+            is_bg = lambda idx: abs(val_func(idx) - bg_val) <= tol
+        elif raw_pixels is not None:
+            corner_vals = [raw_pixels[i] for i in corner_indices]
+            bg_val = statistics.median(corner_vals)
+            tol = threshold
+            if not fill_holes:
+                return bytearray(1 if abs(raw_pixels[i] - bg_val) > tol else 0 for i in range(total))
+            is_bg = lambda idx: abs(raw_pixels[idx] - bg_val) <= tol
         else:
-            is_bg = lambda idx: (raw_pixels[idx] >> 8 if is_16bit else raw_pixels[idx]) >= (255 - threshold)
+            return bytearray(b'\x01' * total)
 
     visited = bytearray(total)
     queue = deque()
+    q_append = queue.append
+    w_minus_1 = grid_cols - 1
+    h_minus_1 = grid_rows - 1
 
     for x in range(grid_cols):
-        for y in (0, grid_rows - 1):
-            idx = y * grid_cols + x
-            if not visited[idx] and is_bg(idx):
-                visited[idx] = 1
-                queue.append((x, y))
+        if not visited[x] and is_bg(x):
+            visited[x] = 1
+            q_append(x)
+        idx_b = h_minus_1 * grid_cols + x
+        if not visited[idx_b] and is_bg(idx_b):
+            visited[idx_b] = 1
+            q_append(idx_b)
 
-    for y in range(grid_rows):
-        for x in (0, grid_cols - 1):
-            idx = y * grid_cols + x
-            if not visited[idx] and is_bg(idx):
-                visited[idx] = 1
-                queue.append((x, y))
+    for y in range(1, h_minus_1):
+        idx_l = y * grid_cols
+        if not visited[idx_l] and is_bg(idx_l):
+            visited[idx_l] = 1
+            q_append(idx_l)
+        idx_r = y * grid_cols + w_minus_1
+        if not visited[idx_r] and is_bg(idx_r):
+            visited[idx_r] = 1
+            q_append(idx_r)
 
+    q_pop = queue.popleft
     while queue:
-        cx, cy = queue.popleft()
-        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nx, ny = cx + dx, cy + dy
-            if 0 <= nx < grid_cols and 0 <= ny < grid_rows:
-                n_idx = ny * grid_cols + nx
-                if not visited[n_idx] and is_bg(n_idx):
-                    visited[n_idx] = 1
-                    queue.append((nx, ny))
+        idx = q_pop()
+        x = idx % grid_cols
+        if x > 0:
+            n = idx - 1
+            if not visited[n] and is_bg(n):
+                visited[n] = 1
+                q_append(n)
+        if x < w_minus_1:
+            n = idx + 1
+            if not visited[n] and is_bg(n):
+                visited[n] = 1
+                q_append(n)
+        if idx >= grid_cols:
+            n = idx - grid_cols
+            if not visited[n] and is_bg(n):
+                visited[n] = 1
+                q_append(n)
+        if idx < h_minus_1 * grid_cols:
+            n = idx + grid_cols
+            if not visited[n] and is_bg(n):
+                visited[n] = 1
+                q_append(n)
 
     is_object = bytearray(1 if not visited[i] else 0 for i in range(total))
     return is_object
@@ -501,7 +617,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             img_input = inputs.addStringValueInput('imagePath', 'Файл зображення', saved.get('imagePath', ''))
             img_input.isReadOnly = True
             inputs.addBoolValueInput('browseBtn', 'Обрати зображення...', False, '', False)
-            auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати прозорі поля (для PNG з Alpha-прозорістю)', True, '', saved.get('autoCrop', False))
+            auto_crop = inputs.addBoolValueInput('autoCrop', 'Обрізати поля навколо об\'єкта (Alpha / Колір фону)', True, '', saved.get('autoCrop', False))
             auto_crop.isVisible = False
             inputs.addBoolValueInput('keepAspect', 'Зберігати пропорції (Aspect Ratio)', True, '', saved.get('keepAspect', True))
 
@@ -511,33 +627,43 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             # ---- Форма заготовки ----
             shape_dd = inputs.addDropDownCommandInput('shapeType', 'Форма заготовки', adsk.core.DropDownStyles.TextListDropDownStyle)
             saved_shape = saved.get('shapeType', 'Прямокутник')
-            for s_name in ['Прямокутник', 'Коло / Овал', 'Багатокутник', 'Контур зображення (Alpha / Прозорість)']:
-                shape_dd.listItems.add(s_name, s_name == saved_shape, '')
+            for s_name in ['Прямокутник', 'Коло / Овал', 'Багатокутник', 'Контур зображення (Alpha / Колір фону)']:
+                is_sel = (s_name == saved_shape) or (saved_shape.startswith('Контур зображення') and s_name.startswith('Контур зображення'))
+                shape_dd.listItems.add(s_name, is_sel, '')
 
             mm = 'mm'
             def_w = f"{saved.get('rectWidth', 100.0)} mm"
             def_l = f"{saved.get('rectLength', 100.0)} mm"
             def_r = f"{saved.get('polyRadius', 50.0)} mm"
 
+            is_contour_init = saved_shape.startswith('Контур зображення')
+            is_rect_init = (saved_shape == 'Прямокутник')
+            is_circle_init = (saved_shape == 'Коло / Овал')
+            is_poly_init = (saved_shape == 'Багатокутник')
+            drop_bg_init = saved.get('dropBackground', True)
+
             rect_w = inputs.addValueInput('rectWidth', 'Ширина (X)', mm, adsk.core.ValueInput.createByString(def_w))
-            rect_w.isVisible = (saved_shape == 'Прямокутник' or saved_shape == 'Контур зображення (Alpha / Прозорість)')
+            rect_w.isVisible = (is_rect_init or is_contour_init)
             rect_l = inputs.addValueInput('rectLength', 'Довжина (Y)', mm, adsk.core.ValueInput.createByString(def_l))
-            rect_l.isVisible = (saved_shape == 'Прямокутник' or saved_shape == 'Контур зображення (Alpha / Прозорість)')
+            rect_l.isVisible = (is_rect_init or is_contour_init)
 
             circle_dx = inputs.addValueInput('circleDiaX', 'Діаметр X (Ширина)', mm, adsk.core.ValueInput.createByString(def_w))
-            circle_dx.isVisible = (saved_shape == 'Коло / Овал')
+            circle_dx.isVisible = is_circle_init
             circle_dy = inputs.addValueInput('circleDiaY', 'Діаметр Y (Довжина)', mm, adsk.core.ValueInput.createByString(def_l))
-            circle_dy.isVisible = (saved_shape == 'Коло / Овал')
+            circle_dy.isVisible = is_circle_init
 
             poly_sides = inputs.addIntegerSpinnerCommandInput('polySides', 'Кількість граней', 3, 36, 1, saved.get('polySides', 6))
-            poly_sides.isVisible = (saved_shape == 'Багатокутник')
+            poly_sides.isVisible = is_poly_init
             poly_r = inputs.addValueInput('polyRadius', 'Радіус (до вершини)', mm, adsk.core.ValueInput.createByString(def_r))
-            poly_r.isVisible = (saved_shape == 'Багатокутник')
+            poly_r.isVisible = is_poly_init
 
-            alpha_thresh = inputs.addIntegerSpinnerCommandInput('alphaThreshold', 'Поріг прозорості (1-254)', 1, 254, 1, saved.get('alphaThreshold', 32))
-            alpha_thresh.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
+            drop_bg = inputs.addBoolValueInput('dropBackground', 'Вирівнювати колір фону до Z = 0 (плоска основа)', True, '', drop_bg_init)
+            drop_bg.isVisible = not is_contour_init
+
+            alpha_thresh = inputs.addIntegerSpinnerCommandInput('alphaThreshold', 'Чутливість виявлення фону (1-254)', 1, 254, 1, saved.get('alphaThreshold', 32))
+            alpha_thresh.isVisible = (is_contour_init or drop_bg_init)
             fill_holes = inputs.addBoolValueInput('fillHoles', 'Суцільна основа (запобігати діркам у тінях)', True, '', saved.get('fillHoles', True))
-            fill_holes.isVisible = (saved_shape == 'Контур зображення (Alpha / Прозорість)')
+            fill_holes.isVisible = is_contour_init
 
             # ---- Орієнтація початку координат ----
             inputs.addSeparatorCommandInput('sep_origin')
@@ -636,7 +762,7 @@ class CommandValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
             shape_dd = inputs.itemById('shapeType')
             if shape_dd and shape_dd.selectedItem:
                 shape = shape_dd.selectedItem.name
-                if shape in ('Прямокутник', 'Контур зображення (Alpha / Прозорість)'):
+                if shape == 'Прямокутник' or shape.startswith('Контур зображення'):
                     w = inputs.itemById('rectWidth')
                     l = inputs.itemById('rectLength')
                     if not w or not l or w.value <= 0 or l.value <= 0:
@@ -696,12 +822,12 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                                 shape_dd = inputs.itemById('shapeType')
                                 shape = shape_dd.selectedItem.name if shape_dd else 'Прямокутник'
                                 auto_crop_input = inputs.itemById('autoCrop')
-                                auto_crop = (auto_crop_input.value if auto_crop_input else False) and (shape == 'Контур зображення (Alpha / Прозорість)')
+                                auto_crop = (auto_crop_input.value if auto_crop_input else False) and shape.startswith('Контур зображення')
 
                                 alpha_thresh_input = inputs.itemById('alphaThreshold')
                                 thresh = alpha_thresh_input.value if alpha_thresh_input else 32
 
-                                bbox = get_content_bbox(probe_img, only_alpha=True, threshold=thresh) if auto_crop else None
+                                bbox = get_content_bbox(probe_img, only_alpha=False, threshold=thresh) if auto_crop else None
                                 if bbox:
                                     pw = bbox[2] - bbox[0]
                                     ph = bbox[3] - bbox[1]
@@ -730,7 +856,7 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 is_rect = (shape == 'Прямокутник')
                 is_circle = (shape == 'Коло / Овал')
                 is_poly = (shape == 'Багатокутник')
-                is_alpha = (shape == 'Контур зображення (Alpha / Прозорість)')
+                is_alpha = shape.startswith('Контур зображення')
 
                 inputs.itemById('rectWidth').isVisible = (is_rect or is_alpha)
                 inputs.itemById('rectLength').isVisible = (is_rect or is_alpha)
@@ -738,9 +864,22 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 inputs.itemById('circleDiaY').isVisible = is_circle
                 inputs.itemById('polySides').isVisible = is_poly
                 inputs.itemById('polyRadius').isVisible = is_poly
-                inputs.itemById('alphaThreshold').isVisible = is_alpha
+
+                drop_bg_input = inputs.itemById('dropBackground')
+                if drop_bg_input:
+                    drop_bg_input.isVisible = not is_alpha
+                drop_bg_val = drop_bg_input.value if drop_bg_input else True
+
+                inputs.itemById('alphaThreshold').isVisible = (is_alpha or drop_bg_val)
                 inputs.itemById('fillHoles').isVisible = is_alpha
                 inputs.itemById('autoCrop').isVisible = is_alpha
+
+            if changed.id == 'dropBackground':
+                shape_item = inputs.itemById('shapeType').selectedItem if inputs.itemById('shapeType') else None
+                shape = shape_item.name if shape_item else ''
+                is_alpha = shape.startswith('Контур зображення')
+                if not is_alpha and inputs.itemById('alphaThreshold'):
+                    inputs.itemById('alphaThreshold').isVisible = changed.value
 
             # Перемикання твердотільної основи та CAM інструментів
             if changed.id == 'createSolidBase' or changed.id == 'createMountingHoles' or changed.id == 'edgeTreatment':
@@ -759,8 +898,14 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
             # Оновлення інформаційної панелі
             def_mm = lambda i_id: adsk.core.ValueCommandInput.cast(inputs.itemById(i_id)).value * 10.0 if inputs.itemById(i_id) else 100.0
             shape_val = inputs.itemById('shapeType').selectedItem.name if inputs.itemById('shapeType') and inputs.itemById('shapeType').selectedItem else 'Прямокутник'
-            w_mm = def_mm('rectWidth') if shape_val == 'Прямокутник' else def_mm('alphaWidth')
-            l_mm = def_mm('rectLength') if shape_val == 'Прямокутник' else def_mm('alphaLength')
+            if shape_val == 'Коло / Овал':
+                w_mm = def_mm('circleDiaX')
+                l_mm = def_mm('circleDiaY')
+            elif shape_val == 'Багатокутник':
+                w_mm = l_mm = def_mm('polyRadius') * 2.0
+            else:
+                w_mm = def_mm('rectWidth')
+                l_mm = def_mm('rectLength')
             sp_mm = def_mm('vertexSpacing')
             if sp_mm > 0 and w_mm > 0 and l_mm > 0:
                 cols = max(2, int(round(w_mm / sp_mm)) + 1)
@@ -850,7 +995,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if gamma_val <= 0: gamma_val = 1.0
 
             auto_crop_input = inputs.itemById('autoCrop')
-            auto_crop = (auto_crop_input.value if auto_crop_input else False) and (shape == 'Контур зображення (Alpha / Прозорість)')
+            auto_crop = (auto_crop_input.value if auto_crop_input else False) and shape.startswith('Контур зображення')
 
             create_solid_base = inputs.itemById('createSolidBase').value if inputs.itemById('createSolidBase') else False
             solid_base_thickness = val_mm('solidBaseThickness') if create_solid_base else 0.0
@@ -876,6 +1021,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'polyRadius': val_mm('polyRadius') if inputs.itemById('polyRadius') else 50.0,
                 'alphaThreshold': int_val('alphaThreshold') if inputs.itemById('alphaThreshold') else 32,
                 'fillHoles': inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True,
+                'dropBackground': inputs.itemById('dropBackground').value if inputs.itemById('dropBackground') else True,
                 'autoCrop': inputs.itemById('autoCrop').value if inputs.itemById('autoCrop') else False,
                 'keepAspect': inputs.itemById('keepAspect').value if inputs.itemById('keepAspect') else True,
                 'maxDepth': max_depth,
@@ -896,7 +1042,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             })
 
             # Габарити
-            if shape == 'Прямокутник' or shape == 'Контур зображення (Alpha / Прозорість)':
+            if shape == 'Прямокутник' or shape.startswith('Контур зображення'):
                 width_mm = val_mm('rectWidth')
                 height_mm = val_mm('rectLength')
             elif shape == 'Коло / Овал':
@@ -927,8 +1073,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             img_raw = Image.open(image_path)
 
             if auto_crop:
-                crop_thresh = int_val('alphaThreshold')
-                bbox = get_content_bbox(img_raw, only_alpha=True, threshold=crop_thresh)
+                crop_thresh = int_val('alphaThreshold') if inputs.itemById('alphaThreshold') else 32
+                bbox = get_content_bbox(img_raw, only_alpha=False, threshold=crop_thresh)
                 if bbox: img_raw = img_raw.crop(bbox)
 
             has_alpha = (img_raw.mode in ('RGBA', 'LA') or ('transparency' in img_raw.info))
@@ -950,11 +1096,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 img_resized = img_conv.resize((grid_cols, grid_rows), getattr(Image, 'Resampling', Image).BILINEAR)
                 max_val = 65535.0
                 lut_size = 65536
+                img_resized_rgb = None
+                rgb_arr = None
+                rgb_bytes = None
             else:
-                if has_alpha: img_gray = img_resized_alpha.convert('L')
-                else: img_gray = img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)
+                if has_alpha:
+                    img_gray = img_resized_alpha.convert('L')
+                    img_resized_rgb = img_resized_alpha.convert('RGB')
+                else:
+                    img_resized_rgb = img_raw.convert('RGB').resize((grid_cols, grid_rows), resample_filter)
+                    img_gray = img_resized_rgb.convert('L')
                 max_val = 255.0
                 lut_size = 256
+                rgb_arr = np.asarray(img_resized_rgb, dtype=np.uint8) if HAS_NUMPY else None
+                rgb_bytes = img_resized_rgb.tobytes() if not HAS_NUMPY else None
 
             # LUT
             lut = [0.0] * lut_size
@@ -971,16 +1126,45 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             step_x = width_mm / (grid_cols - 1)
             step_y = height_mm / (grid_rows - 1)
 
+            is_contour = shape.startswith('Контур зображення')
+            drop_bg = inputs.itemById('dropBackground').value if inputs.itemById('dropBackground') else True
+            threshold = int_val('alphaThreshold') if inputs.itemById('alphaThreshold') else 32
+            fill_holes = inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True
+
+            # Виявлення маски фону
+            bg_object_mask = None
+            mask_bytes = None
+            if is_contour or drop_bg:
+                mask_bytes = detect_outer_mask(
+                    grid_cols, grid_rows,
+                    alpha_bytes=alpha_bytes,
+                    rgb_arr=rgb_arr,
+                    rgb_bytes=rgb_bytes,
+                    raw_pixels=(img_conv.tobytes() if is_16bit else None),
+                    is_16bit=is_16bit,
+                    threshold=threshold,
+                    fill_holes=fill_holes
+                )
+                if HAS_NUMPY:
+                    bg_object_mask = np.array(mask_bytes, dtype=bool).reshape((grid_rows, grid_cols))
+
             if HAS_NUMPY:
                 lut_arr = np.array(lut, dtype=np.float32)
                 raw_arr = np.clip(np.asarray(img_resized, dtype=np.int32), 0, 65535) if is_16bit else np.asarray(img_gray, dtype=np.uint8)
 
                 z_rel = np.take(lut_arr, raw_arr)
 
+                # Опускаємо колір фону до Z=0
+                if bg_object_mask is not None and (drop_bg or is_contour):
+                    z_rel[~bg_object_mask] = 0.0
+
                 # Реальне плаваюче 2D-гаусове згладжування висот
                 if smooth_passes > 0:
                     sigma_val = float(smooth_passes) * 0.9 + 0.3
                     z_rel = gaussian_blur_2d(z_rel, sigma=sigma_val)
+                    if bg_object_mask is not None and drop_bg and shape == 'Прямокутник':
+                        z_rel[~bg_object_mask] = 0.0
+
                 y_idx, x_idx = np.ogrid[:grid_rows, :grid_cols]
                 x_grid = x_idx * step_x
                 y_grid = (grid_rows - 1 - y_idx) * step_y
@@ -1029,10 +1213,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             idx += 1
                     inside_mask = np.array(mask_flat, dtype=bool).reshape((grid_rows, grid_cols))
                 else:
-                    threshold = int_val('alphaThreshold')
-                    fill_holes = inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True
-                    mask_bytes = detect_outer_mask(grid_cols, grid_rows, (img_resized_alpha.split()[-1].tobytes() if has_alpha else None), (img_conv.tobytes() if is_16bit else img_gray.tobytes()), is_16bit, threshold, fill_holes)
-                    inside_mask = np.array(mask_bytes, dtype=bool).reshape((grid_rows, grid_cols))
+                    if bg_object_mask is not None:
+                        inside_mask = bg_object_mask
+                    else:
+                        mask_bytes = detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=rgb_arr, rgb_bytes=rgb_bytes, raw_pixels=(img_conv.tobytes() if is_16bit else None), is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
+                        inside_mask = np.array(mask_bytes, dtype=bool).reshape((grid_rows, grid_cols))
 
                 v00 = (np.arange(grid_rows - 1)[:, None] * grid_cols + np.arange(grid_cols - 1)[None, :]).ravel()
                 v10 = v00 + 1; v01 = v00 + grid_cols; v11 = v01 + 1
@@ -1071,13 +1256,23 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     boundary_edges = list(boundary_edges_set)
 
             else:
-                raw_pixels = (array.array('I', img_resized.tobytes()) if is_16bit else (img_resized_alpha.convert('L') if has_alpha else img_raw.convert('L').resize((grid_cols, grid_rows), resample_filter)).tobytes())
+                raw_pixels = (array.array('I', img_resized.tobytes()) if is_16bit else img_gray.tobytes())
                 vx_table = [x * step_x for x in range(grid_cols)]
                 vy_table = [(grid_rows - 1 - y) * step_y for y in range(grid_rows)]
 
                 all_z = [lut[min(65535, max(0, raw_pixels[i])) if is_16bit else raw_pixels[i]] for i in range(grid_cols * grid_rows)]
+
+                if mask_bytes is not None and (drop_bg or is_contour):
+                    for i in range(grid_cols * grid_rows):
+                        if not mask_bytes[i]:
+                            all_z[i] = 0.0
+
                 if smooth_passes > 0:
                     all_z = smooth_grid_python(all_z, grid_cols, grid_rows, passes=smooth_passes)
+                    if mask_bytes is not None and drop_bg and shape == 'Прямокутник':
+                        for i in range(grid_cols * grid_rows):
+                            if not mask_bytes[i]:
+                                all_z[i] = 0.0
 
                 all_vertices = [None] * (grid_cols * grid_rows)
                 idx = 0
@@ -1132,9 +1327,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                                 if point_in_polygon(vx, vy, poly): inside_mask[idx] = 1
                                 idx += 1
                     else:
-                        threshold = int_val('alphaThreshold')
-                        fill_holes = inputs.itemById('fillHoles').value if inputs.itemById('fillHoles') else True
-                        inside_mask = detect_outer_mask(grid_cols, grid_rows, (img_resized_alpha.split()[-1].tobytes() if has_alpha else None), (img_conv.tobytes() if is_16bit else raw_pixels), is_16bit, threshold, fill_holes)
+                        inside_mask = mask_bytes if mask_bytes is not None else detect_outer_mask(grid_cols, grid_rows, alpha_bytes=alpha_bytes, rgb_arr=None, rgb_bytes=rgb_bytes, raw_pixels=(img_conv.tobytes() if is_16bit else None), is_16bit=is_16bit, threshold=threshold, fill_holes=fill_holes)
 
                     top_triangles = []
                     append_tri = top_triangles.append
