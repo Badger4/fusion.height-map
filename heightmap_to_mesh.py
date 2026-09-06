@@ -600,6 +600,67 @@ def smooth_grid_python(heights, cols, rows, passes=1):
     return curr
 
 
+def limit_slope(z_mat, max_slope_angle_deg=55.0, step_x=0.1, step_y=0.1, iters=8):
+    """Обмеження максимального кута нахилу та перепаду висот між сусідніми вершинами (Slope Limiter)."""
+    if max_slope_angle_deg <= 0.0 or max_slope_angle_deg >= 90.0:
+        return z_mat
+    max_dz_x = math.tan(math.radians(max_slope_angle_deg)) * max(1e-6, step_x)
+    max_dz_y = math.tan(math.radians(max_slope_angle_deg)) * max(1e-6, step_y)
+    z = z_mat.copy()
+    for _ in range(iters):
+        dy = np.diff(z, axis=0)
+        excess_pos = np.maximum(0.0, dy - max_dz_y)
+        excess_neg = np.minimum(0.0, dy + max_dz_y)
+        excess_y = excess_pos + excess_neg
+        z[:-1, :] += excess_y * 0.25
+        z[1:, :] -= excess_y * 0.25
+
+        dx = np.diff(z, axis=1)
+        excess_pos_x = np.maximum(0.0, dx - max_dz_x)
+        excess_neg_x = np.minimum(0.0, dx + max_dz_x)
+        excess_x = excess_pos_x + excess_neg_x
+        z[:, :-1] += excess_x * 0.25
+        z[:, 1:] -= excess_x * 0.25
+    return z
+
+
+def limit_slope_python(heights, cols, rows, max_slope_angle_deg=55.0, step_x=0.1, step_y=0.1, passes=2):
+    """Чистий Python-fallback для обмеження крутизни схилів."""
+    if max_slope_angle_deg <= 0.0 or max_slope_angle_deg >= 90.0:
+        return heights
+    max_dz_x = math.tan(math.radians(max_slope_angle_deg)) * max(1e-6, step_x)
+    max_dz_y = math.tan(math.radians(max_slope_angle_deg)) * max(1e-6, step_y)
+    curr = list(heights)
+    for _ in range(passes):
+        nxt = list(curr)
+        for y in range(rows):
+            row = y * cols
+            y_prev = (y - 1) * cols if y > 0 else row
+            y_next = (y + 1) * cols if y < rows - 1 else row
+            for x in range(cols):
+                idx = row + x
+                val = curr[idx]
+                if x > 0:
+                    diff = val - curr[idx - 1]
+                    if diff > max_dz_x: val -= (diff - max_dz_x) * 0.25
+                    elif diff < -max_dz_x: val -= (diff + max_dz_x) * 0.25
+                if x < cols - 1:
+                    diff = val - curr[idx + 1]
+                    if diff > max_dz_x: val -= (diff - max_dz_x) * 0.25
+                    elif diff < -max_dz_x: val -= (diff + max_dz_x) * 0.25
+                if y > 0:
+                    diff = val - curr[y_prev + x]
+                    if diff > max_dz_y: val -= (diff - max_dz_y) * 0.25
+                    elif diff < -max_dz_y: val -= (diff + max_dz_y) * 0.25
+                if y < rows - 1:
+                    diff = val - curr[y_next + x]
+                    if diff > max_dz_y: val -= (diff - max_dz_y) * 0.25
+                    elif diff < -max_dz_y: val -= (diff + max_dz_y) * 0.25
+                nxt[idx] = val
+        curr = nxt
+    return curr
+
+
 # =====================================================================
 # Швидкий Binary STL експортер
 # =====================================================================
@@ -821,6 +882,14 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             inputs.addValueInput('vertexSpacing', 'Крок сітки (деталізація)', mm, adsk.core.ValueInput.createByString(f"{saved.get('vertexSpacing', 0.5)} mm"))
             inputs.addIntegerSpinnerCommandInput('smoothPasses', 'Згладжування рельєфу (0 = вимк, 1-10)', 0, 10, 1, saved.get('smoothPasses', 1))
 
+            inputs.addBoolValueInput('enableDespeckle', '🧹 Усувати точковий шум та відблиски (Despeckle)', True, '', saved.get('enableDespeckle', True))
+            inputs.addBoolValueInput('enableSlopeLimit', '⛰️ Обмежувати різкі перепади (захист від урвищ >1 мм)', True, '', saved.get('enableSlopeLimit', True))
+            slope_dd = inputs.addDropDownCommandInput('maxSlopeAngle', 'Максимальний кут схилу', adsk.core.DropDownStyles.TextListDropDownStyle)
+            saved_slope = saved.get('maxSlopeAngle', '55° (Оптимально: плавні переходи без урвищ)')
+            for sl_name in ['45° (Дуже плавні пологі схили)', '55° (Оптимально: плавні переходи без урвищ)', '65° (Помірно крутий)', '75° (Круті стінки)']:
+                slope_dd.listItems.add(sl_name, sl_name == saved_slope, '')
+            slope_dd.isVisible = saved.get('enableSlopeLimit', True)
+
             # Плавний згасаючий край (Vignette Fade)
             enable_fade = inputs.addBoolValueInput('enableVignetteFade', 'Плавне згасання країв до основи (Vignette Fade)', True, '', saved.get('enableVignetteFade', False))
             fade_w = inputs.addValueInput('fadeWidth', 'Ширина згасання країв (мм)', mm, adsk.core.ValueInput.createByString(f"{saved.get('fadeWidth', 5.0)} mm"))
@@ -975,7 +1044,7 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                                 shape_dd = inputs.itemById('shapeType')
                                 shape = shape_dd.selectedItem.name if shape_dd else 'Прямокутник'
                                 auto_crop_input = inputs.itemById('autoCrop')
-                                auto_crop = (auto_crop_input.value if auto_crop_input else False) and shape.startswith('Контур зображення')
+                                auto_crop = auto_crop_input.value if auto_crop_input else False
 
                                 alpha_thresh_input = inputs.itemById('alphaThreshold')
                                 thresh = alpha_thresh_input.value if alpha_thresh_input else 32
@@ -1040,6 +1109,10 @@ class InputChangedHandler(adsk.core.InputChangedEventHandler):
                 is_alpha = shape.startswith('Контур зображення')
                 if not is_alpha and inputs.itemById('alphaThreshold'):
                     inputs.itemById('alphaThreshold').isVisible = changed.value
+
+            if changed.id == 'enableSlopeLimit':
+                if inputs.itemById('maxSlopeAngle'):
+                    inputs.itemById('maxSlopeAngle').isVisible = changed.value
 
             # Перемикання співвідношення сторін або зміна розмірів
             if changed.id == 'aspectRatio':
@@ -1179,8 +1252,15 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             max_depth = val_mm('maxDepth')
             base_thickness = val_mm('baseThickness')
             vertex_spacing = val_mm('vertexSpacing')
-            if vertex_spacing <= 0: vertex_spacing = 0.5
             smooth_passes = int_val('smoothPasses')
+            enable_despeckle = inputs.itemById('enableDespeckle').value if inputs.itemById('enableDespeckle') else False
+            enable_slope_limit = inputs.itemById('enableSlopeLimit').value if inputs.itemById('enableSlopeLimit') else False
+            slope_angle_item = inputs.itemById('maxSlopeAngle').selectedItem if inputs.itemById('maxSlopeAngle') else None
+            slope_angle_str = slope_angle_item.name if slope_angle_item else '55° (Оптимально: плавні переходи без урвищ)'
+            try:
+                max_slope_angle = float(slope_angle_str.split('°')[0].strip())
+            except:
+                max_slope_angle = 55.0
 
             enable_vignette = inputs.itemById('enableVignetteFade').value if inputs.itemById('enableVignetteFade') else False
             fade_width = val_mm('fadeWidth') if enable_vignette else 0.0
@@ -1230,6 +1310,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 'baseThickness': base_thickness,
                 'vertexSpacing': vertex_spacing,
                 'smoothPasses': smooth_passes,
+                'enableDespeckle': enable_despeckle,
+                'enableSlopeLimit': enable_slope_limit,
+                'maxSlopeAngle': slope_angle_str,
                 'enableVignetteFade': enable_vignette,
                 'fadeWidth': fade_width,
                 'invertHeight': invert_height,
@@ -1298,6 +1381,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             if is_16bit:
                 img_conv = img_raw.convert('I')
                 img_resized = fit_image_to_grid(img_conv, grid_cols, grid_rows, fit_mode=fit_mode)
+                if enable_despeckle:
+                    img_resized = img_resized.filter(ImageFilter.MedianFilter(size=3))
                 max_val = 65535.0
                 lut_size = 65536
                 img_resized_rgb = None
@@ -1311,6 +1396,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     img_rgb = img_raw.convert('RGB')
                     img_resized_rgb = fit_image_to_grid(img_rgb, grid_cols, grid_rows, fit_mode=fit_mode)
                     img_gray = img_resized_rgb.convert('L')
+                if enable_despeckle:
+                    img_gray = img_gray.filter(ImageFilter.MedianFilter(size=3))
+                    if img_resized_rgb is not None:
+                        img_resized_rgb = img_resized_rgb.filter(ImageFilter.MedianFilter(size=3))
                 max_val = 255.0
                 lut_size = 256
                 rgb_arr = np.asarray(img_resized_rgb, dtype=np.uint8) if HAS_NUMPY else None
@@ -1370,10 +1459,17 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 if bg_object_mask is not None and (drop_bg or is_contour):
                     z_rel[~bg_object_mask] = 0.0
 
-                # Реальне плаваюче 2D-гаусове згладжування висот
+                # Реальне плаваюче 2D-гаусове згладжування висот (фізичне масштабування)
                 if smooth_passes > 0:
-                    sigma_val = float(smooth_passes) * 0.9 + 0.3
+                    sigma_mm = float(smooth_passes) * 0.20
+                    sigma_val = max(0.6, sigma_mm / max(0.001, vertex_spacing))
                     z_rel = gaussian_blur_2d(z_rel, sigma=sigma_val)
+                    if bg_object_mask is not None and drop_bg:
+                        z_rel[~bg_object_mask] = 0.0
+
+                # Обмеження крутизни схилів (захист від різких урвищ >1 мм)
+                if enable_slope_limit and max_slope_angle > 0:
+                    z_rel = limit_slope(z_rel, max_slope_angle_deg=max_slope_angle, step_x=step_x, step_y=step_y, iters=8)
                     if bg_object_mask is not None and drop_bg:
                         z_rel[~bg_object_mask] = 0.0
 
@@ -1485,6 +1581,13 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
                 if smooth_passes > 0:
                     all_z = smooth_grid_python(all_z, grid_cols, grid_rows, passes=smooth_passes)
+                    if mask_bytes is not None and drop_bg:
+                        for i in range(grid_cols * grid_rows):
+                            if not mask_bytes[i]:
+                                all_z[i] = 0.0
+
+                if enable_slope_limit and max_slope_angle > 0:
+                    all_z = limit_slope_python(all_z, grid_cols, grid_rows, max_slope_angle_deg=max_slope_angle, step_x=step_x, step_y=step_y, passes=2)
                     if mask_bytes is not None and drop_bg:
                         for i in range(grid_cols * grid_rows):
                             if not mask_bytes[i]:
